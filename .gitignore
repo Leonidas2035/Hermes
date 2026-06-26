@@ -1,0 +1,48 @@
+# === SECRETS — НІКОЛИ НЕ ПУШИТИ ===
+.env
+.env.save
+auth.json
+auth.lock
+gateway.lock
+gateway.pid
+shared/                  # NousResearch JWT tokens
+
+# === MEMORY LOCK FILES ===
+memories/*.lock
+
+# === RUNTIME STATE (великі / тимчасові файли) ===
+state.db
+state.db-shm
+state.db-wal
+kanban.db
+kanban.db.init.lock
+gateway_state.json
+processes.json
+.hermes_history
+.update_check
+interrupt_debug.log
+
+# === КЕШІ ===
+audio_cache/
+image_cache/
+cache/
+
+# === ЛОГИ ===
+logs/
+
+# === SESSION STATE ===
+sessions/
+pairing/
+sandboxes/
+lsp/
+
+# === HERMES AGENT (окремий git-репо) ===
+hermes-agent/
+
+# === HERMES CORE BINARY (встановлюється окремо) ===
+bin/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
