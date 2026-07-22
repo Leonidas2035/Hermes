@@ -1,0 +1,44 @@
+# Ignore everything by default
+*
+.*/
+
+# Except:
+!/.gitignore
+!/SOUL.md
+!/config.yaml
+!/FULL_SYSTEM_CONTEXT.txt
+
+# Allow memories directory and files
+!/memories/
+!/memories/**
+/memories/*.lock
+
+# Allow skills directory and files
+!/skills/
+!/skills/**
+/skills/**/*.lock
+
+# Allow quantumedge_analysis directory and subdirectories
+!/quantumedge_analysis/
+!/quantumedge_analysis/**/
+
+# Whitelist python files and readme
+!/quantumedge_analysis/**/*.py
+!/quantumedge_analysis/**/*.md
+
+# Allow tools directory
+!/quantumedge_analysis/tools/
+!/quantumedge_analysis/tools/**/
+!/quantumedge_analysis/tools/**/*.py
+!/quantumedge_analysis/tools/**/*.js
+!/quantumedge_analysis/tools/**/*.md
+!/quantumedge_analysis/tools/**/*.json
+
+# Ignore env, databases, venv, and logs in quantumedge_analysis
+/quantumedge_analysis/.env
+/quantumedge_analysis/venv/
+/quantumedge_analysis/runtime/
+/quantumedge_analysis/_agy_*
+/quantumedge_analysis/history/
+/quantumedge_analysis/*.jsonl
+/quantumedge_analysis/*.json

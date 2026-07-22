@@ -1,0 +1,9 @@
+{
+  "last_report_path": "/home/layman/.hermes/logs/curator/20260717-075017",
+  "last_run_at": "2026-07-17T07:50:17.143933+00:00",
+  "last_run_duration_seconds": 0.237038,
+  "last_run_summary": "auto: no changes; llm: skipped (consolidation off)",
+  "last_run_summary_shown_at": null,
+  "paused": false,
+  "run_count": 2
+}
