@@ -1,7 +1,11 @@
 model:
-  default: tencent/hy3
-  provider: nous
-  base_url: https://inference-api.nousresearch.com/v1
+  default: qwen2.5-coder:7b
+  provider: custom
+  base_url: http://localhost:11434/v1
+  api_key: sk-ollama
+  api_mode: chat_completions
+  context_length: 65536
+  ollama_num_ctx: 65536
 fallback_providers: []
 credential_pool_strategies:
   gemini: fill_first
@@ -696,3 +700,10 @@ session_reset:
 fallback_model:
   provider: openrouter
   model: tencent/hy3
+custom_providers:
+  - name: Local (localhost:11434)
+    base_url: http://localhost:11434/v1
+    model: qwen2.5-coder:7b
+    api_mode: chat_completions
+    context_length: 65536
+    ollama_num_ctx: 65536

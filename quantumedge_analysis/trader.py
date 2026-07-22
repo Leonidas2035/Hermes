@@ -197,128 +197,89 @@ def get_raw_open_orders() -> list:
             pass
 
 def smart_stop_loss(snap, price, indicators: dict = None, book: dict = None, manip: dict = None, conviction: float = 1.0):
-    """Розумний алгоритм SL (замість плоського BE).
-    
-    1. Прибрати стекінг: перед новим SL скасовувати старий (cancel по ID + ідемпотентність).
-    2. Розумний SL замість плоского BE: breakeven + крихта як мінімум; трейлінг по ATR/ціні;
-       не рухати при HIGH-маніпуляції; тісніший SL при розвороті (RSI>70 + MACD_hist<0 або пробій bid-wall);
-       запас від entry проти гепу.
-    """
-    actions = []
-    
-    # Отримуємо всі сирі відкриті ордери від CCXT, щоб мати точні stopLossPrice
-    raw_orders = get_raw_open_orders()
-    
-    for leg in snap.get("legs", []):
-        if leg["size"] <= 0:
-            continue
-        entry = leg["entry"]
-        if not entry:
-            continue
-        u = leg["uPnL"]
-        if u <= 0:
-            continue  # лише профітні позиції
-            
-        pos_side = leg["side"]
-        
-        # Визначаємо базовий SL (breakeven + крихта)
-        # Для LONG: entry * (1 + BE_PROFIT_PCT / 100)
-        # Для SHORT: entry * (1 - BE_PROFIT_PCT / 100)
-        if pos_side == "long":
-            base_sl = entry * (1.0 + BE_PROFIT_PCT / 100.0)
-        else:
-            base_sl = entry * (1.0 - BE_PROFIT_PCT / 100.0)
-            
-        # Розраховуємо зміну ціни у відсотках від входу
-        if pos_side == "long":
-            move_pct = (price - entry) / entry * 100.0
-        else:
-            move_pct = (entry - price) / entry * 100.0
-            
-        # Перевірка на розворот
-        reversal = False
-        reversal_reason = ""
-        if SL_TIGHTEN_ON_REVERSAL and indicators:
-            rsi = indicators.get("rsi")
-            macd_hist = indicators.get("macd_hist")
-            
-            if pos_side == "long":
-                # Умова розвороту для LONG: RSI > 70 ТА MACD_hist < 0
-                if rsi is not None and rsi > 70 and macd_hist is not None and macd_hist < 0:
-                    reversal = True
-                    reversal_reason = f"RSI={round(rsi,1)} MACD_hist={round(macd_hist,4)}"
-                # АБО пробій bid-wall
-                elif book and book.get("bid_walls"):
-                    highest_bid_wall = max(w[0] for w in book["bid_walls"])
-                    if price < highest_bid_wall:
-                        reversal = True
-                        reversal_reason = f"price broken bid-wall ({price} < {highest_bid_wall})"
-            else:
-                # Умова розвороту для SHORT: RSI < 30 ТА MACD_hist > 0
-                if rsi is not None and rsi < 30 and macd_hist is not None and macd_hist > 0:
-                    reversal = True
-                    reversal_reason = f"RSI={round(rsi,1)} MACD_hist={round(macd_hist,4)}"
-                # АБО пробій ask-wall
-                elif book and book.get("ask_walls"):
-                    lowest_ask_wall = min(w[0] for w in book["ask_walls"])
-                    if price > lowest_ask_wall:
-                        reversal = True
-                        reversal_reason = f"price broken ask-wall ({price} > {lowest_ask_wall})"
-        
-        # Перевірка на маніпуляцію
-        manip_hold = False
-        if manip and manip.get("severity") == "HIGH" and conviction < 0.6:
-            manip_hold = True
-            
-        # Визначаємо новий цільовий Stop-Loss
-        reason = "BE"
-        new_sl = base_sl
-        
-        if reversal:
-            # Тісніший SL при розвороті: тримаємо base_sl (entry + BE_PROFIT_PCT)
-            # без трейлу, щоб зафіксувати прибуток
-            new_sl = base_sl
-            reason = "reversal-tighten"
-        elif manip_hold:
-            # Не рухаємо SL при HIGH-маніпуляції з низькою conviction
-            new_sl = base_sl
-            reason = "manip-hold"
-        elif move_pct >= TRAIL_TRIGGER_PCT:
-            # Трейлінг по ATR/ціні активований
-            if pos_side == "long":
-                trail_sl = price * (1.0 - TRAIL_DIST_PCT / 100.0)
-                new_sl = max(base_sl, trail_sl)
-            else:
-                trail_sl = price * (1.0 + TRAIL_DIST_PCT / 100.0)
-                new_sl = min(base_sl, trail_sl)
-            reason = "trail"
-            
-        # Знаходимо всі поточні Stop-Loss ордери для цієї ноги в системі
-        target_side = "sell" if pos_side == "long" else "buy"
-        existing_sls = []
-        for o in raw_orders:
-            info = o.get("info", {})
-            is_sl = False
-            if o.get("type") in ("stop", "trigger") or o.get("stopLossPrice") is not None or o.get("triggerPrice") is not None:
-                is_sl = True
-            elif info.get("stopLossPrice") or info.get("triggerPrice") or info.get("stopPrice") or info.get("type") == "STOP_MARKET":
-                is_sl = True
-            
-            pos_side_info = info.get("positionSide", "").upper()
-            if is_sl and pos_side_info == pos_side.upper():
-                trig = o.get("stopLossPrice") or info.get("stopPrice")
-                if trig is not None:
-                    try:
-                        trig = float(trig)
-                    except ValueError:
-                        pass
-                existing_sls.append((o.get("id"), trig))
+    try:
+        actions = []
+        raw_orders = get_raw_open_orders()
+        for leg in snap.get("legs", []):
+            if leg["size"] <= 0:
+                continue
+            entry = leg["entry"]
+            if not entry:
+                continue
+            u = leg["uPnL"]
+            if u <= 0:
+                continue
                 
-        # Розраховуємо нове значення, округлене до 4 знаків
-        new_sl_rounded = round(new_sl, 4)
-        
-        # Перевірка ідемпотентності:
-        # Якщо вже є рівно ОДИН SL і його ціна дорівнює # =====================================================================
+            pos_side = leg["side"]
+            if pos_side == "long":
+                base_sl = entry * (1.0 + BE_PROFIT_PCT / 100.0)
+                move_pct = (price - entry) / entry * 100.0
+            else:
+                base_sl = entry * (1.0 - BE_PROFIT_PCT / 100.0)
+                move_pct = (entry - price) / entry * 100.0
+                
+            reversal = False
+            if SL_TIGHTEN_ON_REVERSAL and indicators:
+                rsi = indicators.get("rsi")
+                macd_hist = indicators.get("macd_hist")
+                if pos_side == "long":
+                    if rsi is not None and rsi > 70 and macd_hist is not None and macd_hist < 0:
+                        reversal = True
+                else:
+                    if rsi is not None and rsi < 30 and macd_hist is not None and macd_hist > 0:
+                        reversal = True
+            
+            manip_hold = False
+            if manip and manip.get("severity") == "HIGH" and conviction < 0.6:
+                manip_hold = True
+                
+            new_sl = base_sl
+            if reversal:
+                new_sl = base_sl
+            elif manip_hold:
+                new_sl = base_sl
+            elif move_pct >= TRAIL_TRIGGER_PCT:
+                if pos_side == "long":
+                    trail_sl = price * (1.0 - TRAIL_DIST_PCT / 100.0)
+                    new_sl = max(base_sl, trail_sl)
+                else:
+                    trail_sl = price * (1.0 + TRAIL_DIST_PCT / 100.0)
+                    new_sl = min(base_sl, trail_sl)
+                    
+            existing_sls = []
+            for o in raw_orders:
+                info = o.get("info", {})
+                is_sl = False
+                if o.get("type") in ("stop", "trigger") or o.get("stopLossPrice") is not None or o.get("triggerPrice") is not None:
+                    is_sl = True
+                elif info.get("stopLossPrice") or info.get("triggerPrice") or info.get("stopPrice") or info.get("type") == "STOP_MARKET":
+                    is_sl = True
+                
+                pos_side_info = info.get("positionSide", "").upper()
+                if is_sl and pos_side_info == pos_side.upper():
+                    trig = o.get("stopLossPrice") or info.get("stopPrice")
+                    if trig is not None:
+                        try:
+                            trig = float(trig)
+                        except ValueError:
+                            pass
+                    existing_sls.append((o.get("id"), trig))
+                    
+            new_sl_rounded = round(new_sl, 4)
+            if len(existing_sls) == 1:
+                curr_id, curr_trig = existing_sls[0]
+                if curr_trig is not None and abs(curr_trig - new_sl_rounded) < 0.0001:
+                    continue
+                    
+            qe(["modify_sl", pos_side, str(new_sl_rounded)])
+        return {"ok": True}
+    except Exception as e:
+        return {"modified": False, "error": str(e)}
+
+
+
+
+# =====================================================================
 # РІШЕННЯ ТРЕЙДЕРА
 # =====================================================================
 def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
@@ -327,6 +288,7 @@ def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
     Отримує перелік торгових команд у форматі JSON, парсить їх та виконує.
     """
     import re
+    import os
     
     verdict = report["verdict"]
     tech = report["technicals"]
@@ -352,83 +314,109 @@ def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
     balance = snap.get("balance", {})
     free_balance = float(balance.get("free") or 0)
     
-    # 2. Розраховуємо обмеження нотіоналу
-    SAFE_NOTIONAL = 900_000.0  # USDT запас
-    long_leg = next((l for l in legs if l["side"] == "long"), None)
-    short_leg = next((l for l in legs if l["side"] == "short"), None)
-    
-    long_size = float(long_leg["size"]) if long_leg else 0.0
-    short_size = float(short_leg["size"]) if short_leg else 0.0
-    
-    long_notional = long_size * price
-    short_notional = short_size * price
-    
-    room_notional = max(0.0, SAFE_NOTIONAL - long_notional)
-    room_contracts = int(room_notional / price) if price > 0 else 0
-    
-    # Розраховуємо відстань до ліквідації лонгу
-    liq_long = float(long_leg.get("liquidationPrice") or 0) if long_leg else 0.0
-    dist_to_liq_pct = 999.0
-    if liq_long > 0 and price > 0:
-        dist_to_liq_pct = (price - liq_long) / price * 100.0
-        
-    # 3. Будуємо промпт для Antigravity
-    prompt = f"""You are the 2T+ Antigravity Trading Brain.
-You must analyze the current market state and output a precise trading plan and execution commands.
+    # 2. Отримуємо макро-контекст по крос-парам (BTC/SOL, BTC/XRP)
 
-### OWNER RULES (MUST BE STRICTLY FOLLOWED):
-1. NEVER close a losing position manually. If uPnL < 0, wait or hedge.
-2. Shrink a losing position ONLY with the profit from the opposite-direction position (harvesting).
-3. If indicators are bullish, add LONG. If the trend is exhausted, take profit + add SHORT (do not add to losing side).
-4. High risk -> hedge (open/add opposite side) and wait. Trigger: distance to long liquidation < 1.0%.
-5. Auto-stop is OFF.
-6. Short notional cap is 101,209 USDT. If net short exposure is > 101,209, short can ONLY be shrunk, do NOT add short!
-7. Long cap is 1,000,000 USDT (safe target 900,000 USDT). Max allowed contracts to add to long: {room_contracts}.
+    btc_ctx = report.get("btc") or {}
+    btc_price = btc_ctx.get("btc_last") or 0.0
+    sol_price = btc_ctx.get("sol_last") or 0.0
+    xrp_price = btc_ctx.get("xrp_last") or snap.get("mark_price") or price
+    btc_sol_ratio = btc_ctx.get("btc_sol_ratio") or 0.0
+    btc_xrp_ratio = btc_ctx.get("btc_xrp_ratio") or 0.0
+    
+    # Розрахунок запасу маржі та Decay Function
+    total_balance = float(balance.get("total") or 1.0)
+    free_pct = (free_balance / total_balance) * 100.0 if total_balance > 0 else 100.0
+    margin_rule = ""
+    if free_pct < 30.0:
+        margin_rule = "⚠️ CRITICAL MARGIN SAFETY (Free Margin < 30%): New 'place buy' or 'market buy' orders are STRICTLY FORBIDDEN! You can ONLY execute 'cancel', 'close', or 'harvest' commands."
+    elif free_pct < 40.0:
+        margin_rule = "📉 MARGIN DECAY ACTIVE (Free Margin < 40%): Reduce all new order sizes by 50% to preserve capital."
 
-### CURRENT STATE SNAPSHOT:
-- Asset: XRPUSDT (on Bybit/BingX VST)
-- Current price: {price}
-- Open orders count: {open_orders_count}
-- Distance to LONG liquidation: {dist_to_liq_pct:.3f}% (Liq price: {liq_long})
-- Long Position size: {long_size} (Notional: {long_notional:.1f} USDT, uPnL: {long_leg.get('uPnL') if long_leg else 0.0})
-- Short Position size: {short_size} (Notional: {short_notional:.1f} USDT, uPnL: {short_leg.get('uPnL') if short_leg else 0.0})
-- Free Balance: {free_balance} USDT
-- Open Orders List: {json.dumps(open_orders, default=str)}
+    # Liqmap дані для Front-running TP
+    liq_map = report.get("liq_map") or {}
 
-### MARKET DATA & METRICS:
+    # 3. Будуємо промпт для Antigravity з HERMES TRADING DNA v2.0
+    prompt = f"""You are the 2T+ Antigravity Trading Brain operating under HERMES TRADING DNA v2.0.
+You must analyze the multi-asset market state (XRP, BTC, SOL) and output precise execution commands.
+
+### ACTIVE TRADING PAIRS:
+- XRPUSDT
+- BTCUSDT
+- SOLUSDT
+
+### CROSS-PAIR RATIOS & PRICES:
+- BTC/USDT: {btc_price} (24h: {btc_ctx.get('btc_change24')}%)
+- SOL/USDT: {sol_price} (24h: {btc_ctx.get('sol_change24')}%)
+- XRP/USDT: {xrp_price} (24h: {btc_ctx.get('xrp_change24')}%)
+- BTC/SOL Ratio: {btc_sol_ratio}
+- BTC/XRP Ratio: {btc_xrp_ratio}
+
+### LIQUIDATION MAP MAGNETS (LIQMAP FRONT-RUNNING):
+- Data: {json.dumps(liq_map, indent=2, default=str)}
+- Target Rule: Place Take-Profit orders 0.1% BEFORE major short liquidation magnets or Ask Walls to ensure guaranteed fill before liquidity exhaustion.
+
+### MARGIN STATUS & DECAY RULE:
+- Total Balance: {total_balance:.2f} VST | Free Balance: {free_balance:.2f} VST ({free_pct:.1f}% free)
+{margin_rule}
+
+### HERMES TRADING DNA v2.0 RULES:
+1. NEVER close a losing position manually if uPnL < 0. Shrink losing legs ONLY via profit harvesting (net realized PnL >= 0).
+2. Auto-stop is OFF.
+3. Order TTL (Time-to-Live): Cancel any limit order if price moved > 2.0% away from the order price.
+4. Breakeven Lock: When Unrealized PnL reaches >= +1.0%, lock profit by target stop at entry * 1.001.
+5. Counter-Trade Permission: Opening counter SHORT positions on rallies is ALLOWED near Ask Walls / Resistance / RSI > 70. Set active Take-Profit targets (+1.0% to +1.5%). Avoid dead 1-to-1 locks.
+6. BingX Hedge Mode Bug Protection: All short/sell closing commands execute with reduceOnly=True automatically.
+
+### SOLANA (SOL) SMART DCA STRATEGY (MOMENTUM BREAKOUT):
+- Allocation Split (25% Market Entry / 75% Dynamic Limit DCA):
+  1. Immediate Market Entry (25% size, e.g. 5.0 to 10.0 SOL): Execute `["market", "buy", "LONG", qty, "SOL"]` on strong momentum.
+  2. Dynamic Limit DCA Grid (75% size, e.g. 15.0 to 35.0 SOL): Place `["place", "buy", "LONG", qty, price, "SOL"]` limit orders at 0.5 * ATR and 1.0 * ATR below price.
+
+### HEDGED LOCK ("ЗАМОК") RESOLUTION PROTOCOL:
+- Unlock open LONG and SHORT legs step-by-step near key Support/Resistance via profit harvesting (net PnL >= 0).
+
+### CURRENT POSITIONS SNAPSHOT (ALL COINS):
+{json.dumps(legs, indent=2, default=str)}
+
+### OPEN ORDERS LIST:
+{json.dumps(open_orders, indent=2, default=str)}
+
+### MARKET INDICATORS & BIAS:
 - Indicator Bias: {bias} (Conviction: {conviction * 100:.1f}%)
 - Technical indicators: {json.dumps(tech, default=str)}
-- Trend shift status: {json.dumps(trend, default=str)}
 - Order Book walls & imbalance: {json.dumps(book, default=str)}
-- Market Manipulation: {json.dumps(manip, default=str)}
-- BTC context: {json.dumps(report.get('btc'), default=str)}
-- BTC Liquidation Map zones: {json.dumps(report.get('liq_map'), default=str)}
-- TradingView technical rating: {json.dumps(report.get('tv'), default=str)}
-- News sentiment: {json.dumps(report.get('news'), default=str)}
 
 ### TASK:
-1. Write a very brief analysis of the current market state and your plan (in Ukrainian, max 5 lines).
-2. Define the exact ccxt/qe_trade commands to execute.
+1. Write a very brief analysis of the market and cross-pair trends (in Ukrainian, max 3 lines).
+2. Define exact ccxt/qe_trade execution commands.
 3. Output the commands ONLY in a ```json code block at the very end of your response.
 
 Valid commands format (JSON array of arrays):
 ```json
 [
-  ["place", "buy"|"sell", "LONG"|"SHORT", qty, price, tp, sl],
-  ["market", "buy"|"sell", "LONG"|"SHORT", qty],
-  ["cancel", "order_id"],
-  ["modify_sl", "LONG"|"SHORT", new_sl_price]
+  ["place", "buy"|"sell", "LONG"|"SHORT", qty, price, "XRP"|"BTC"|"SOL"],
+  ["market", "buy"|"sell", "LONG"|"SHORT", qty, "XRP"|"BTC"|"SOL"],
+  ["cancel", "order_id"]
 ]
 ```
 If no action is required, output: `[]`.
 """
+
     
-    print("[TRADER] Invoking Antigravity (2T+) for trading decision...")
+    print("[TRADER] Invoking Antigravity for trading decision...")
     
-    # 4. Викликаємо agy CLI
+    # 4. Визначаємо модель та викликаємо agy CLI
+    agy_model = os.getenv("AGY_MODEL")
+    agy_cmd = ["agy", "--dangerously-skip-permissions", "--print", prompt]
+    if agy_model:
+        agy_cmd = ["agy", "--model", agy_model, "--dangerously-skip-permissions", "--print", prompt]
+        print(f"[TRADER] Using custom model: {agy_model}")
+    else:
+        print("[TRADER] Using default agy model")
+        
     try:
         r = subprocess.run(
-            ["agy", "--dangerously-skip-permissions", "--print", prompt],
+            agy_cmd,
             capture_output=True, text=True, timeout=120
         )
         if r.returncode != 0:
@@ -475,18 +463,13 @@ If no action is required, output: `[]`.
                 cmd_args.pop()
                 
             print(f"[TRADER] Executing command: {[action_type] + cmd_args}")
-            res = qe(cmd_args)
+            res = qe([action_type] + cmd_args)
             
             # Логування дії
             act_entry = {"act": f"AG_{action_type.upper()}", "cmd": [action_type] + cmd_args, "result": res}
             actions.append(act_entry)
             
             log_entry = {"act": f"AG_{action_type.upper()}", "args": cmd_args, "result": (res.get("error") or res.get("id") or "ok")}
-            if action_type == "place" and len(cmd_args) >= 3:
-                log_entry["qty"] = cmd_args[2]
-                log_entry["price"] = cmd_args[3] if len(cmd_args) > 3 else "0"
-            elif action_type == "market" and len(cmd_args) >= 3:
-                log_entry["qty"] = cmd_args[2]
             jlog(log_entry)
             
     except subprocess.TimeoutExpired:
@@ -507,7 +490,31 @@ If no action is required, output: `[]`.
         "price": price,
         "notes": verdict.get("notes", []),
         "actions": actions,
+        "raw_response": response
     }
+
+
+def send_telegram_report(msg: str):
+    """Надсилає повідомлення безпосередньо у Telegram через Bot API."""
+    import os
+    import urllib.request
+    import urllib.parse
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHANNEL_ID") or os.getenv("TELEGRAM_ALLOWED_USERS")
+    if not token or not chat_id:
+        print("[TRADER] Telegram credentials missing, skipping report.")
+        return
+    if "," in chat_id:
+        chat_id = chat_id.split(",")[0].strip()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            response.read()
+        print("[TRADER] Telegram report sent successfully.")
+    except Exception as e:
+        print(f"[TRADER] Failed to send Telegram report: {e}")
 
 
 # =====================================================================
@@ -517,7 +524,7 @@ def main(deep: bool = False):
     mode = "DEEP(15m)" if deep else "TRADE(5m)"
     print(f"[TRADER] {mode} cycle start {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
-    # 1. Аналіз (мозок акули)
+    # 1. Аналіз
     report = analyze()
     save_analysis(report)
 
@@ -529,18 +536,14 @@ def main(deep: bool = False):
     result = decide_and_act(report, state, deep=deep)
     save_state(state)
 
-    # 3. Звіт
+    # 3. Звіт у консоль
     print(f"[TRADER] bias={result.get('bias')} conv={result.get('conviction')} "
           f"decision={result.get('decision')} actions={len(result.get('actions', []))}")
     for a in result.get("actions", []):
         print(f"   - {a['act']}: {a.get('qty', a.get('price', ''))}")
-    if result.get("notes"):
-        for n in result["notes"]:
-            print(f"   * {n}")
 
     # 4. Підсумок PnL з журналу
     try:
-        import re
         realized = 0.0
         wins = 0
         closed = 0
@@ -558,9 +561,75 @@ def main(deep: bool = False):
         state["trades"] = closed
         state["wins"] = wins
         save_state(state)
-        print(f"[TRADER] realized PnL (journal): {realized:.2f} VST | {wins}/{closed} wins")
     except Exception as e:
         print(f"[TRADER] pnl read warn: {e}")
+
+    # 5. Надсилаємо КОРОТКИЙ звіт у Telegram
+    try:
+        snap = qe(["snapshot"])
+        legs = snap.get("legs", [])
+
+        btc_ctx = report.get("btc") or {}
+        btc_price = btc_ctx.get("btc_last") or 0.0
+        sol_price = btc_ctx.get("sol_last") or 0.0
+        xrp_price = btc_ctx.get("xrp_last") or snap.get("mark_price") or 0.0
+        btc_sol = btc_ctx.get("btc_sol_ratio") or 0.0
+        btc_xrp = btc_ctx.get("btc_xrp_ratio") or 0.0
+
+        balance_total = float(snap.get("balance", {}).get("total") or 0.0)
+        balance_free = float(snap.get("balance", {}).get("free") or 0.0)
+
+        def fmt_pos(sym):
+            p_long = next((l for l in legs if (l.get("symbol") or "").upper() == sym and l["side"] == "long"), None)
+            p_short = next((l for l in legs if (l.get("symbol") or "").upper() == sym and l["side"] == "short"), None)
+            parts = []
+            if p_long:
+                parts.append(f"🟢L: <code>{p_long['size']:,.1f}</code> ({p_long['uPnL']:+.1f})")
+            if p_short:
+                parts.append(f"🔴S: <code>{p_short['size']:,.1f}</code> ({p_short['uPnL']:+.1f})")
+            return " | ".join(parts) if parts else "Немає"
+
+        xrp_pos = fmt_pos("XRP")
+        btc_pos = fmt_pos("BTC")
+        sol_pos = fmt_pos("SOL")
+
+        import html
+        raw_resp = result.get("raw_response") or ""
+        m_lines = []
+        for line in raw_resp.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("```"):
+                continue
+            m_lines.append(line)
+            if len(m_lines) >= 3:
+                break
+        analysis_text = html.escape("\n".join(m_lines))
+
+
+        tg_msg = (
+            f"<b>📊 QuantumEdge Multi-Asset | Цикл #{state['cycle']}</b>\n"
+            f"🪙 <b>BTC:</b> <code>{btc_price:,.1f}</code> | <b>SOL:</b> <code>{sol_price:,.2f}</code> | <b>XRP:</b> <code>{xrp_price:.4f}</code>\n"
+            f"📊 <b>Крос-пари:</b> BTC/SOL: <code>{btc_sol}</code> | BTC/XRP: <code>{btc_xrp}</code>\n\n"
+            f"<b>🔒 Позиції («Замок»):</b>\n"
+            f"• <b>XRP:</b> {xrp_pos}\n"
+            f"• <b>BTC:</b> {btc_pos}\n"
+            f"• <b>SOL:</b> {sol_pos}\n\n"
+            f"<b>💳 Баланс:</b> <code>{balance_total:,.0f} VST</code> (Вільний: <code>{balance_free:,.0f}</code>)\n"
+            f"⚡ <b>Вердикт:</b> <b>{result.get('decision')}</b> ({result.get('bias')})\n"
+        )
+
+        if analysis_text:
+            tg_msg += f"\n<i>{analysis_text}</i>\n"
+
+        if result.get("actions"):
+            tg_msg += "\n<b>🛠 Ордери:</b>\n"
+            for a in result["actions"]:
+                cmd = a["cmd"]
+                tg_msg += f"• <code>{' '.join(cmd[:5])}</code>\n"
+
+        send_telegram_report(tg_msg)
+    except Exception as te:
+        print(f"[TRADER] Telegram send exception: {te}")
 
     print(f"[TRADER] cycle {state['cycle']} done.")
 
@@ -568,3 +637,4 @@ def main(deep: bool = False):
 if __name__ == "__main__":
     deep_flag = "--deep" in sys.argv
     main(deep=deep_flag)
+

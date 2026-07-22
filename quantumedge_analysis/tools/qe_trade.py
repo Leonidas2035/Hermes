@@ -105,10 +105,15 @@ async def snapshot(ex):
     except Exception as e:
         out["balance_error"] = str(e)
     try:
-        ps = await ex.fetch_positions(symbols=[CCXT_SYMBOL])
-        out["legs"] = [{"side":p.get("side"),"size":float(p.get("contracts") or 0),
-                        "entry":float(p.get("entryPrice") or 0),"uPnL":float(p.get("unrealizedPnl") or 0),
-                        "lev":p.get("leverage")} for p in ps if float(p.get("contracts") or 0)!=0]
+        ps = await ex.fetch_positions()
+        out["legs"] = [{
+            "symbol": (p.get("symbol") or "").split(":")[0].replace("/USDT", ""),
+            "side": p.get("side"),
+            "size": float(p.get("contracts") or 0),
+            "entry": float(p.get("entryPrice") or 0),
+            "uPnL": float(p.get("unrealizedPnl") or 0),
+            "lev": p.get("leverage")
+        } for p in ps if float(p.get("contracts") or 0) != 0]
     except Exception as e:
         out["positions_error"] = str(e)
     try:
@@ -121,34 +126,44 @@ async def snapshot(ex):
     return out
 
 
-async def place(ex, side, pos_side, qty, price, tp=None, sl=None):
+def _resolve_symbol(sym: str | None) -> str:
+    if not sym or str(sym).lower() in ("none", "null", ""):
+        return CCXT_SYMBOL
+    base = str(sym).upper().replace("/USDT", "").replace("USDT", "").strip()
+    return f"{base}/USDT:USDT"
+
+
+async def place(ex, side, pos_side, qty, price, tp=None, sl=None, symbol=None):
+    target_symbol = _resolve_symbol(symbol)
     params = {"positionSide": pos_side.upper(), "hedged": True}
+    
+    # Encapsulate reduceOnly for closing/harvesting legs to prevent BingX 109420/109400 errors
+    if (side.lower() == "sell" and pos_side.upper() == "LONG") or (side.lower() == "buy" and pos_side.upper() == "SHORT"):
+        params["reduceOnly"] = True
+
     if tp is not None and str(tp).lower() not in ("none", "null", ""):
         params["takeProfit"] = {"triggerPrice": float(tp)}
     if sl is not None and str(sl).lower() not in ("none", "null", ""):
         params["stopLoss"] = {"triggerPrice": float(sl)}
-    o = await ex.create_order(symbol=CCXT_SYMBOL, type="limit", side=side.lower(),
+    o = await ex.create_order(symbol=target_symbol, type="limit", side=side.lower(),
                                amount=float(qty), price=float(price), params=params)
-    jlog({"act":"place","side":side,"pos":pos_side,"qty":qty,"price":price,"tp":tp,"sl":sl,"id":o.get("id")})
-    return {"id":o.get("id"),"side":o.get("side"),"amount":o.get("amount"),"price":o.get("price"),"status":o.get("status"),"intended_tp":tp,"intended_sl":sl}
+    jlog({"act":"place","symbol":target_symbol,"side":side,"pos":pos_side,"qty":qty,"price":price,"tp":tp,"sl":sl,"id":o.get("id")})
+    return {"id":o.get("id"),"symbol":target_symbol,"side":o.get("side"),"amount":o.get("amount"),"price":o.get("price"),"status":o.get("status"),"intended_tp":tp,"intended_sl":sl}
 
 
-async def set_sl(ex, pos_side, new_sl):
-    """Трейлінг-стоп: виставляє/оновлює СЛ позиції (breakeven / міні-профіт).
-    Для BingX: скасовує існуючий СЛ-ордер та виставляє новий з amount = розмір позиції.
-    Повертає результат запиту."""
+
+async def set_sl(ex, pos_side, new_sl, symbol=None):
+    """Трейлінг-стоп: виставляє/оновлює СЛ позиції (breakeven / міні-профіт)."""
+    target_symbol = _resolve_symbol(symbol)
     try:
         await ex.load_markets()
-        
-        # 1. Отримуємо розмір поточної позиції
-        ps = await ex.fetch_positions(symbols=[CCXT_SYMBOL])
+        ps = await ex.fetch_positions(symbols=[target_symbol])
         pos = next((p for p in ps if p.get("side", "").upper() == pos_side.upper() and float(p.get("contracts") or 0) > 0), None)
         if not pos:
             return {"modified": False, "error": f"no open position found for side {pos_side}"}
         qty = float(pos["contracts"])
 
-        # 2. Шукаємо та скасовуємо існуючі СЛ-ордери для цієї сторони
-        oo = await ex.fetch_open_orders(CCXT_SYMBOL)
+        oo = await ex.fetch_open_orders(target_symbol)
         cancelled_count = 0
         for o in oo:
             info = o.get("info", {})
@@ -161,27 +176,26 @@ async def set_sl(ex, pos_side, new_sl):
             pos_side_info = info.get("positionSide", "").upper()
             if is_sl and pos_side_info == pos_side.upper():
                 try:
-                    await ex.cancel_order(o["id"], CCXT_SYMBOL)
+                    await ex.cancel_order(o["id"], target_symbol)
                     cancelled_count += 1
                     jlog({"act": "cancel_sl_order", "id": o["id"], "pos": pos_side})
-                except Exception as ce:
+                except Exception:
                     pass
 
-        # 3. Виставляємо новий СЛ stop-ордер
         sl_side = "sell" if pos_side.upper() == "LONG" else "buy"
         params = {
             "positionSide": pos_side.upper(),
             "stopLossPrice": float(new_sl)
         }
         o = await ex.create_order(
-            symbol=CCXT_SYMBOL,
+            symbol=target_symbol,
             type="market",
             side=sl_side,
             amount=qty,
             price=None,
             params=params
         )
-        jlog({"act": "modify_sl", "pos": pos_side, "new_sl": new_sl, "qty": qty, "cancelled_old": cancelled_count, "ok": True})
+        jlog({"act": "modify_sl", "symbol": target_symbol, "pos": pos_side, "new_sl": new_sl, "qty": qty, "cancelled_old": cancelled_count, "ok": True})
         return {
             "modified": True,
             "new_sl": new_sl,
@@ -195,36 +209,34 @@ async def set_sl(ex, pos_side, new_sl):
         return {"modified": False, "error": str(e)[:300]}
 
 
-async def market(ex, side, pos_side, qty):
-    # snapshot position entry BEFORE closing, to compute realized PnL ourselves
-    # (BingX VST does not return realizedPnl via ccxt; fetchLedger unsupported)
+async def market(ex, side, pos_side, qty, symbol=None):
+    target_symbol = _resolve_symbol(symbol)
     entry = None; mark = None
     try:
         await ex.load_markets()
-        ps = await ex.fetch_positions(symbols=[CCXT_SYMBOL])
+        ps = await ex.fetch_positions(symbols=[target_symbol])
         for p in ps:
             if str(p.get("side","")).upper() == pos_side.upper() and float(p.get("contracts") or 0)!=0:
                 entry = float(p.get("entryPrice") or 0)
-        ob = await ex.fetch_order_book(CCXT_SYMBOL, limit=5)
+        ob = await ex.fetch_order_book(target_symbol, limit=5)
         bids, asks = ob.get("bids",[]), ob.get("asks",[])
         mark = (bids[0][0]+asks[0][0])/2 if bids and asks else None
     except Exception:
         pass
-    o = await ex.create_order(symbol=CCXT_SYMBOL, type="market", side=side,
+    o = await ex.create_order(symbol=target_symbol, type="market", side=side,
                               amount=float(qty), params={"positionSide": pos_side.upper()})
-    # realized pnl: closing a LONG (side=sell) profits when mark>entry;
-    # closing a SHORT (side=buy) profits when entry>mark.
     realized = None
     if entry and mark:
         if pos_side.upper()=="LONG":
             realized = round((mark-entry)*float(qty), 4)
-        else:  # SHORT
+        else:
             realized = round((entry-mark)*float(qty), 4)
-    rec = {"act":"close","side":side,"pos":pos_side,"qty":float(qty),
+    rec = {"act":"close","symbol":target_symbol,"side":side,"pos":pos_side,"qty":float(qty),
            "entry":entry,"exit":mark,"realized_pnl":realized,"id":o.get("id")}
     jlog(rec)
-    return {"id":o.get("id"),"side":o.get("side"),"amount":o.get("amount"),
+    return {"id":o.get("id"),"symbol":target_symbol,"side":o.get("side"),"amount":o.get("amount"),
             "status":o.get("status"),"entry":entry,"exit":mark,"realized_pnl":realized}
+
 
 
 async def cancel_all(ex):
@@ -306,16 +318,23 @@ async def run():
         if cmd == "snapshot":
             print(json.dumps(await snapshot(ex), default=str))
         elif cmd == "place":
+            # Format: place <side> <posSide> <qty> <price> [symbol] [tp] [sl]
             side,pos,qty,price = sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5]
-            tp = sys.argv[6] if len(sys.argv)>6 else None
-            sl = sys.argv[7] if len(sys.argv)>7 else None
-            print(json.dumps(await place(ex,side,pos,qty,price,tp,sl)))
+            symbol = sys.argv[6] if len(sys.argv)>6 else None
+            tp = sys.argv[7] if len(sys.argv)>7 else None
+            sl = sys.argv[8] if len(sys.argv)>8 else None
+            print(json.dumps(await place(ex,side,pos,qty,price,tp,sl,symbol=symbol)))
         elif cmd == "modify_sl":
             pos_side = sys.argv[2]
             new_sl = sys.argv[3]
-            print(json.dumps(await set_sl(ex, pos_side, new_sl)))
+            symbol = sys.argv[4] if len(sys.argv)>4 else None
+            print(json.dumps(await set_sl(ex, pos_side, new_sl, symbol=symbol)))
         elif cmd == "market":
-            print(json.dumps(await market(ex,sys.argv[2],sys.argv[3],sys.argv[4])))
+            # Format: market <side> <posSide> <qty> [symbol]
+            side,pos,qty = sys.argv[2],sys.argv[3],sys.argv[4]
+            symbol = sys.argv[5] if len(sys.argv)>5 else None
+            print(json.dumps(await market(ex,side,pos,qty,symbol=symbol)))
+
         elif cmd == "cancel_all":
             print(json.dumps(await cancel_all(ex)))
         elif cmd == "cancel":

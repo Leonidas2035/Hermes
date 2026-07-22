@@ -156,9 +156,23 @@ def fetch_btc_context() -> dict:
         out["btc_funding"] = fr.get("fundingRate")
         oi = ex.fetch_open_interest(BTC_SYMBOL)
         out["btc_oi_usd"] = oi.get("openInterestValue")
-        xrp = ex.fetch_ticker(CCXT_SYMBOL)
-        if tk.get("last"):
-            out["xrp_btc"] = round(xrp.get("last") / tk.get("last"), 8)
+
+        sol_tk = ex.fetch_ticker("SOL/USDT:USDT")
+        sol_price = float(sol_tk.get("last") or 0)
+        out["sol_last"] = sol_price
+        out["sol_change24"] = sol_tk.get("percentage")
+
+        xrp_tk = ex.fetch_ticker("XRP/USDT:USDT")
+        xrp_price = float(xrp_tk.get("last") or 0)
+        out["xrp_last"] = xrp_price
+        out["xrp_change24"] = xrp_tk.get("percentage")
+
+        btc_price = float(tk.get("last") or 0)
+        if btc_price > 0:
+            if sol_price > 0:
+                out["btc_sol_ratio"] = round(btc_price / sol_price, 2)
+            if xrp_price > 0:
+                out["btc_xrp_ratio"] = round(btc_price / xrp_price, 2)
     except Exception as e:
         out["btc_error"] = str(e)
     try:

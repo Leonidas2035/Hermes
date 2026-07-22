@@ -5,8 +5,11 @@
 # Except:
 !/.gitignore
 !/SOUL.md
+!/RULES.md
+!/Rules.md
 !/config.yaml
 !/FULL_SYSTEM_CONTEXT.txt
+
 
 # Allow memories directory and files
 !/memories/

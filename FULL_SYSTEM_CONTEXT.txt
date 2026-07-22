@@ -1,796 +1,93 @@
-================================================================================
-  FULL SYSTEM CONTEXT — QuantumEdge + Hermes Agent + Watchdog Daemon
-  Повний контекст системи автономної торгівлі
-  Створено: 2026-07-21 15:59 EEST
-  Автор аудиту: Antigravity (Claude Opus 4.6)
-================================================================================
-
-════════════════════════════════════════════════════════════════════════════════
- 0. ЗАГАЛЬНА АРХІТЕКТУРА (СХЕМА ВЗАЄМОДІЇ)
-════════════════════════════════════════════════════════════════════════════════
-
-Система складається з ТРЬОХ автономних агентів + біржового API:
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        РІВЕНЬ 1: ЛОКАЛЬНИЙ WATCHDOG                       │
-│         RTX 4060 (8GB) · Ollama · hermes3:8b-llama3.1-q5_K_M             │
-│                                                                           │
-│  systemd user service: watchdog.service                                   │
-│  Процес: /home/layman/QuantumEdge/.venv/bin/python3 tools/watchdog.py     │
-│  Цикл: while True → sleep_until_next_5m() (вирівнюється по :00/:05/...)  │
-│                                                                           │
-│  1. qe_trade.py snapshot → позиції/ордери/баланс BingX VST               │
-│  2. ccxt async fetch_ohlcv 5m → vol_index (True Range / ATR-14)           │
-│  3. watchdog_state.json → price_move_pct (дельта 5хв)                     │
-│  4. buffer_pct = abs(mark - liq) / mark (запас до ліквідації)             │
-│  5. Ollama API → JSON рішення {wake, reason, note}                        │
-│  6. ПИШЕ → runtime/watchdog_signal.json                                   │
-│                                                                           │
-│  ⚠ НЕ крон Hermes. Автономний daemon. Restart=always, RestartSec=10.     │
-│  ⚠ НЕ торгує. НЕ аналізує ринок глибоко. Тільки міряє і будить.         │
-└───────────────────────────────┬─────────────────────────────────────────────┘
-                                │ watchdog_signal.json
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        РІВЕНЬ 2: HERMES TRADER                            │
-│         Nous Research API · tencent/hy3 · Хмара                           │
-│                                                                           │
-│  systemd user service: hermes-gateway.service                             │
-│  Процес: python -m hermes_cli.main gateway run                            │
-│  Конфіг: ~/.hermes/config.yaml (model: tencent/hy3, provider: nous)       │
-│  Пам'ять: ~/.hermes/memories/ (MEMORY.md, USER.md)                        │
-│  Платформа: Telegram (connected)                                          │
-│                                                                           │
-│  Крон 5хв (02c3d45bd603): читає watchdog_signal.json
-   • wake=false → поверхневий чек trader.py → SILENT
-   • wake=true, reason=scheduled_5m → корекція SL/грід
-   • wake=true, reason=15m/vol_spike/liq_alert → ШИРОКИЙ збір → agy
-  Крон 15хв (8ea10dca157c): плановий глибокий аналіз
-   • беззастережний ШИРОКИЙ збір даних → виклик agy → trader.py
-│                                                                           │
-│  Торговий мозок: ~/.hermes/quantumedge_analysis/trader.py (637 рядків)    │
-│  Аналітика:     ~/.hermes/quantumedge_analysis/market_analysis.py (533)   │
-│  Індикатори:    ~/.hermes/quantumedge_analysis/indicators.py (155)        │
-│  Дані:          ~/.hermes/quantumedge_analysis/market_data.py (246)       │
-└───────────────────────────────┬─────────────────────────────────────────────┘
-                                │ (тільки при wake=true / 15хв / vol_spike)
-                                │ детальний промпт із зібраними даними
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        РІВЕНЬ 3: AGY (ANTIGRAVITY CLI)                    │
-│         Google Gemini · /home/layman/.local/bin/agy                        │
-│                                                                           │
-│  Виклик: agy --dangerously-skip-permissions --effort high                 │
-│          --add-dir /home/layman/QuantumEdge                                │
-│          --add-dir /home/layman/.hermes/quantumedge_analysis               │
-│          --print "<промпт з даними>"                                      │
-│                                                                           │
-│  • Має доступ до інтернету та новин (Firecrawl)                           │
-│  • Будує індикатори, liqmap, BTC-контекст, прогноз                        │
-│  • Повертає структурований аналіз + рівні TP/SL                           │
-│  • Hermes отримує відповідь → САМ приймає рішення → ордери                │
-└───────────────────────────────┬─────────────────────────────────────────────┘
-                                │ Рішення → qe_trade.py place/market/set_sl
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        БІРЖА: BingX VST (Testnet)                         │
-│         XRP/USDT:USDT · Hedge-Mode · Плече 10x · Демо-рахунок            │
-│                                                                           │
-│  API: CCXT v4.5.64 (async)                                                │
-│  CLI: /home/layman/QuantumEdge/tools/qe_trade.py                          │
-│  Команди: snapshot | place | market | set_sl | cancel | grid | trades     │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-
-════════════════════════════════════════════════════════════════════════════════
- 1. МАТРИЦЯ ФАЙЛІВ МІЖАГЕНТНОЇ ВЗАЄМОДІЇ
-════════════════════════════════════════════════════════════════════════════════
-
-┌────────────────────────────────────────────────────────┬──────────────┬──────────────┬─────────────────────────────────────┐
-│ Файл / Ресурс                                         │ Хто ПИШЕ     │ Хто ЧИТАЄ    │ Призначення                         │
-├────────────────────────────────────────────────────────┼──────────────┼──────────────┼─────────────────────────────────────┤
-│ QuantumEdge/runtime/watchdog_signal.json               │ Watchdog     │ Hermes       │ Сигнал пробудження (wake/reason)    │
-│ QuantumEdge/runtime/watchdog_state.json                │ Watchdog     │ Watchdog     │ Попередня ціна для дельти 5хв       │
-│ QuantumEdge/runtime/local_analysis.json                │ Analyzer     │ Hermes       │ Локальний аналіз ринку (bias/entry) │
-│ QuantumEdge/runtime/liqmap_latest.json                 │ liqmap tools │ Hermes + agy │ Карта ліквідацій (зони/магніти)     │
-│ QuantumEdge/runtime/trade_journal.jsonl                │ qe_trade.py  │ Hermes       │ Журнал виконаних ордерів (PnL)     │
-│ QuantumEdge/runtime/trader_plan.md                     │ Hermes       │ Hermes + agy │ Поточний торговий план              │
-│ QuantumEdge/runtime/autopilot_journal.jsonl            │ autopilot    │ Оператор     │ Журнал нічного автопілота           │
-│ QuantumEdge/runtime/autopilot_state.json               │ autopilot    │ autopilot    │ Стан автопілота                     │
-│ .hermes/quantumedge_analysis/trader_state.json         │ trader.py    │ trader.py    │ Цикл/bias/grid стан трейдера       │
-│ .hermes/quantumedge_analysis/trader_journal.jsonl      │ trader.py    │ Hermes       │ Журнал рішень (728 записів)        │
-│ .hermes/quantumedge_analysis/latest.json               │ analysis     │ Hermes       │ Останній аналіз (індикатори/book)   │
-│ .hermes/quantumedge_analysis/market_analysis.json      │ analysis     │ Hermes       │ Детальний аналіз ринку              │
-│ QuantumEdge/tools/qe_trade.py                          │ (CLI бінар)  │ Watchdog +   │ Єдиний інтерфейс до біржі BingX    │
-│                                                        │              │ Hermes       │                                     │
-│ Ollama http://localhost:11434                           │ (сервер)     │ Watchdog     │ Локальна LLM для wake-рішень       │
-│ /home/layman/.local/bin/agy                            │ (бінар)      │ Hermes       │ Глибокий аналіз із доступом до мережі│
-└────────────────────────────────────────────────────────┴──────────────┴──────────────┴─────────────────────────────────────┘
-
-
-════════════════════════════════════════════════════════════════════════════════
- 2. SYSTEMD СЕРВІСИ (user-level)
-════════════════════════════════════════════════════════════════════════════════
-
-Сервіс 1: watchdog.service
-  Файл:    /home/layman/.config/systemd/user/watchdog.service
-  Статус:  active (running), enabled, Restart=always
-  PID:     31352
-  ExecStart: /home/layman/QuantumEdge/.venv/bin/python3 tools/watchdog.py
-  WorkDir: /home/layman/QuantumEdge
-  Env:     PYTHONUNBUFFERED=1
-  Логи:    journalctl --user -u watchdog.service
-
-Сервіс 2: hermes-gateway.service
-  Файл:    /home/layman/.config/systemd/user/hermes-gateway.service
-  Статус:  active (running), enabled, linger=ON (виживає logout)
-  PID:     31420
-  ExecStart: /home/layman/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
-  WorkDir: /home/layman/.hermes
-  Платформи: Telegram (connected)
-  Логи:    journalctl --user -u hermes-gateway.service
-
-Зовнішній процес: Ollama
-  Бінарник: /home/layman/.local/bin/ollama
-  Endpoint: http://localhost:11434
-  Моделі:   hermes3:8b-llama3.1-q5_K_M (5.7 GB, Q5_K_M)
-             hermes3:8b (4.7 GB, Q4_0)
-  GPU:      RTX 4060 (CUDA v13, LD_LIBRARY_PATH=/home/layman/.local/lib/ollama)
-
-
-════════════════════════════════════════════════════════════════════════════════
- 3. ДЕТАЛЬНИЙ ОПИС: /home/layman/.hermes/
-════════════════════════════════════════════════════════════════════════════════
-
-Кореневий каталог AI-агента Hermes від Nous Research.
-
-3.1 КОНФІГУРАЦІЯ ТА АВТОРИЗАЦІЯ
-────────────────────────────────
-config.yaml (16.3 KB)
-  Головний конфіг агента.
-  model.default: tencent/hy3
-  model.provider: nous
-  model.base_url: https://inference-api.nousresearch.com/v1
-  max_live_sessions: 16
-  agent.max_turns: 150
-  agent.gateway_timeout: 1800
-  toolsets: [hermes-cli]
-  Personalities: noir, catgirl, philosopher, pirate (тощо)
-
-auth.json (10.8 KB)
-  OAuth JWT-токени, refresh-токени, agent_key для Nous Research API.
-  Rate limits: RPM=400, TPM=4M.
-  Записується: hermes_cli auth manager.
-  Читається: API-адаптерами під час запитів.
-
-.env (24 KB)
-  Змінні середовища: API-ключі OpenRouter, BingX, Gemini, Telegram.
-
-SOUL.md (514 B)
-  Системний промпт (персона): "You are Hermes Agent, an intelligent AI
-  assistant created by Nous Research..."
-
-channel_directory.json (211 B)
-  Зареєстровані канали комунікації (Telegram).
-
-context_length_cache.yaml (208 B)
-  Кеш лімітів контекстного вікна моделей.
-
-config.yaml.bak.* (32 файли)
-  Автоматичні бекапи конфігурації.
-
-3.2 ПАМ'ЯТЬ АГЕНТА
-────────────────────
-memories/MEMORY.md (10 рядків)
-  Довготривала пам'ять про проєкт QuantumEdge:
-  - Архітектура: Ollama(Watchdog) → Hermes(Trader) → agy(Analyst)
-  - Правила власника (#1-7: не закривати збиткові, харвест, 1M кап)
-  - Ролі: agy = аналітик + складні позиції; Hermes = трейдер
-  - agy делегування тільки для складних задач (ліміт токенів)
-
-memories/USER.md (6 рядків)
-  Профіль користувача:
-  - Ім'я: Leonid
-  - Мова: українська (завжди відповідати українською)
-  - Стиль: стислі відповіді, економія токенів
-
-3.3 ТОРГОВИЙ МОЗОК (quantumedge_analysis/)
-──────────────────────────────────────────
-Каталог з автономною системою аналізу та прийняття рішень для XRP/USDT.
-
-trader.py (637 рядків)
-  Головний торговий модуль — "мозок акули".
-  Функції:
-  - smart_stop_loss()  — розумний трейлінг SL з параболічним алгоритмом.
-    • TRAIL_TRIGGER_PCT = 0.3% (тригер активації трейлінгу)
-    • TRAIL_DIST_PCT = 0.5% (дистанція стопу від ціни)
-    • BE_PROFIT_PCT = 0.05% (мінімальний запас при BE)
-    • Блокування під час HIGH-маніпуляції orderbook
-    • Затягування SL при RSI>70 + MACD_hist<0 або пробій bid-wall
-    • Ідемпотентність: cancel старого SL перед виставленням нового
-  - decide_and_act()   — головна функція прийняття рішень:
-    • Перевірка skills_signal()
-    • Застосування правил власника (1M кап, no close loss, harvest)
-    • Виконання ордерів через qe_trade.py
-  - get_raw_open_orders() — синхронний CCXT парсер ордерів
-  Записує: trader_state.json, trader_journal.jsonl
-  Читає: market_analysis.py, watchdog_signal.json, BingX API
-
-market_analysis.py (533 рядків)
-  Аналіз ринку:
-  - detect_trend_shift() — MACD flip, BB squeeze/breakout, RSI divergence
-  - Аналіз orderbook depth (bid/ask walls, spoofing, imbalance)
-  - BTC macro кореляція
-  - Повертає: bias, conviction, levels, manipulation severity
-  НЕ торгує — тільки аналіз.
-
-indicators.py (155 рядків)
-  Технічні індикатори через pandas + ta:
-  - RSI(14), MACD(12,26,9), Bollinger Bands(20,2), ATR(14)
-  Читається: market_analysis.py
-
-market_data.py (246 рядків)
-  Збір даних з BingX VST API (CCXT), TradingView ratings (tv_parse.js),
-  та Firecrawl sentiment API.
-
-analysis.py (172 рядки)
-  Допоміжний модуль аналізу.
-
-_monday_study.py (87 рядків)
-  Одноразовий скрипт для дослідження понеділкових паттернів.
-
-latest.json (136 рядків)
-  Останній структурований аналіз (індикатори, book, btc_context, news).
-
-market_analysis.json (217 рядків)
-  Детальний JSON аналізу ринку.
-
-trader_state.json (9 рядків)
-  Поточний стан: cycle=391, last_bias=LONG, grid_active=false.
-
-trader_journal.jsonl (728 записів)
-  Append-only журнал дій: TRAIL_TRAIL, BREAKOUT_UP_SKIP, SL adjustments.
-
-3.4 КРОН-СИСТЕМА (cron/)
-────────────────────────
-jobs.json
-  Реєстр запланованих задач Hermes. ПОТОЧНИЙ СТАН: {"jobs": ["02c3d45bd603", "8ea10dca157c"]}.
-  
-  ЛОГІКА КРОНІВ HERMES:
-  
-  1. Крон 5 хвилин (02c3d45bd603 - керований Watchdog):
-     Читати runtime/watchdog_signal.json
-     IF wake == false AND reason == scheduled_5m:
-       → Запустити trader.py (поверхневий чек)
-       → Якщо uPnL змінився > 2% або нові ордери → короткий звіт у Telegram
-       → Інакше → SILENT (не відповідає)
-     IF wake == true:
-       IF reason == scheduled_5m:
-         → Поверхневий аналіз + корекція SL/грід/харвест
-         → Короткий звіт у Telegram
-       IF reason == scheduled_15m OR vol_spike OR liq_alert:
-         → ШИРОКИЙ збір даних (snapshot, indicators, book, liqmap, news)
-         → Сформувати промпт → виклик agy --print
-         → trader.py → ордери + звіт у Telegram (≤15 рядків)
-
-  2. Крон 15 хвилин (8ea10dca157c - плановий Deep Oversight):
-     unconditional (запускається кожні 15хв)
-     → ШИРОКИЙ збір даних (snapshot, indicators, book, liqmap, news)
-     → Сформувати промпт → виклик agy --print
-     → trader.py → ордери + звіт у Telegram (≤15 рядків)
-
-  ЗВІТНІСТЬ ЩОДО ОРДЕРІВ (Telegram):
-     - Кожного разу, коли виконується будь-яка операція з ордерами (відкриття,
-       закриття, скорочення, збільшення, усереднення тощо), відправляється короткий звіт.
-     - При закритті позиції обов'язково виводиться зафіксований PnL та баланс рахунку.
-
-ticker_heartbeat
-  Timestamp серцебиття крон-тікера (1784638634.868086).
-
-output/
-  Каталог з логами виконання крон-задач.
-
-3.5 СКРИПТИ (scripts/)
-──────────────────────
-watchdog.sh
-  Bash-враппер для запуску watchdog.py через QuantumEdge venv.
-  Використовувався раніше для крону, зараз замінений на systemd service.
-
-run_autopilot.sh
-  Запускає night_autopilot.py з AP_LIVE=1 для нічного автопілота
-  розблокування XRP позицій.
-
-3.6 НАВИЧКИ (skills/trading/)
-─────────────────────────────
-9 модулів торгових навичок, кожен із SKILL.md та опціональними references/:
-
-composite-signal-trading/    — Композитні сигнали (3+ індикатори в один бік)
-crypto-trading-supervision/  — Контроль торгівлі та ризиків
-indicator-signal-backtest/   — Бектестинг індикаторних сигналів
-liq-zone-trading/            — Торгівля зон ліквідації (головний скілл)
-  references/
-    AGENT_ARCHITECTURE_PROMPT.md  — Архітектура агентів (Watchdog→Hermes→agy)
-    bingx_api_quirks.md           — Специфіка BingX API (stopPrice у info)
-    CODER_TASK*.md (9 файлів)     — Завдання для кодера (SL, orderflow, тощо)
-    CODER_VERIFY.md               — Інструкції верифікації коду
-liquidation-heatmap/         — Побудова теплових карт ліквідацій
-orderflow-manipulation/      — Виявлення маніпуляцій orderflow
-quantumedge-backtesting/     — Бектестинг стратегій QuantumEdge
-quantumedge-research/        — Дослідження ринку та стратегій
-trading-system-supervisor/   — Нагляд за торговою системою
-
-3.7 ІНФРАСТРУКТУРА HERMES
-─────────────────────────
-hermes-agent/
-  Git-репозиторій вихідного коду Hermes Agent.
-  Ключові точки входу: cli.py, run_agent.py, mcp_serve.py, batch_runner.py
-  Модулі: hermes_cli/, hermes_state.py, gateway/
-  Інфра: Dockerfile, docker-compose.yml, pyproject.toml
-  Venv: hermes-agent/venv/ (використовується systemd service)
-
-bin/
-  Локальні виконувані файли та CLI-обгортки.
-
-node/
-  Вбудоване середовище Node.js (для tv_parse.js та інших інструментів).
-
-3.8 БАЗИ ДАНИХ
-──────────────
-state.db (85.6 MB)
-  Головна SQLite база: розмови, історія, повороти діалогів.
-
-kanban.db (114.7 KB)
-  SQLite для kanban-дошки завдань.
-
-verification_evidence.db (57.3 KB)
-  SQLite з доказами верифікації задач.
-
-3.9 ЛОГУВАННЯ
-─────────────
-logs/
-  agent.log        — Логи агента (запити до API, tool calls)
-  agent.log.1      — Ротований попередній лог
-  errors.log       — Помилки (HTTP 429 rate limits, тощо)
-  gateway.log      — Логи gateway (з'єднання Telegram)
-  gateway-exit-diag.log     — Діагностика завершення
-  gateway-shutdown-diag.log — Діагностика зупинки
-  update.log       — Логи автооновлення
-  curator/         — Логи куратора задач
-
-3.10 ІНШІ КАТАЛОГИ
-──────────────────
-auth/           — Допоміжні OAuth-дані (google_oauth.json)
-audio_cache/    — Кешовані TTS/STT аудіофайли
-cache/          — Внутрішній кеш продуктивності
-hooks/          — Хуки життєвого циклу (порожній)
-image_cache/    — Тимчасове сховище оброблених зображень
-images/         — Згенеровані статичні зображення
-kanban/         — Стан kanban та блокування
-pairing/        — Файли парінгу пристроїв gateway
-pastes/         — Фрагменти коду та тексту
-platforms/      — Стан підключених платформ (Telegram)
-sandboxes/      — Ізольовані середовища виконання (singularity/)
-sessions/       — Дампи сесій розмов (91 файл)
-shared/         — Спільні auth-файли (nous_auth.json)
-state/          — Метадані стану (rich_sent_index.json)
-state-snapshots/ — Бекапи баз даних стану
-
-
-════════════════════════════════════════════════════════════════════════════════
- 4. ДЕТАЛЬНИЙ ОПИС: /home/layman/QuantumEdge/
-════════════════════════════════════════════════════════════════════════════════
-
-Кореневий каталог торгової системи QuantumEdge — HFT-проєкт з оркестратором,
-ботами, ZMQ-хабом, та ML-інфраструктурою.
-
-4.1 ГОЛОВНІ ФАЙЛИ
-─────────────────
-QuantumEdge.py
-  Головний оркестратор системи. Керує під-процесами (боти, хаби),
-  ZMQ port binding, моніторинг процесів.
-
-start.sh
-  Master launch script: активація venv, налаштування env, запуск сервісів.
-
-.env (змінні середовища)
-  EXECUTION_MODE=bingx
-  USE_TESTNET=true
-  BINGX_API_KEY / BINGX_SECRET (маскировані)
-  BINGX_TESTNET_API_KEY / BINGX_TESTNET_SECRET
-  OPENROUTER_API_KEY
-  GOOGLE_API_KEY
-  TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_USERS / TELEGRAM_HOME_CHANNEL
-  MARKET_DATA_SYMBOLS=XRPUSDT
-  MARKET_DATA_MODE=live
-
-HERMES_STARTER_PROMPT.md
-  Системний промпт для Hermes LLM: правила стратегії, CLI toolkit документація,
-  межі ризику.
-
-4.2 ІНСТРУМЕНТИ (tools/)
-────────────────────────
-Основні робочі скрипти системи, що використовуються агентами:
-
-watchdog.py (~220 рядків) ★ КРИТИЧНИЙ
-  Автономний daemon моніторингу. Працює під systemd watchdog.service.
-  Функції:
-  - fetch_5m_ohlcv_async(): 30 свічок 5m з BingX через CCXT async
-  - get_snapshot(): subprocess → qe_trade.py snapshot
-  - get_vol_index(ohlcv): True Range / ATR-14
-  - ask_local_llm(...): Ollama API (hermes3:8b Q5_K_M)
-  - sleep_until_next_5m(): вирівнювання по 5-хвилинних межах годинника
-  - main(): збір метрик → LLM або fallback → запис сигналу
-  Вхід: BingX API, Ollama, watchdog_state.json
-  Вихід: watchdog_signal.json, watchdog_state.json
-  Режими: daemon (while True) або --oneshot (одноразовий тест)
-
-qe_trade.py (~350 рядків) ★ КРИТИЧНИЙ
-  Єдиний CLI інтерфейс до біржі BingX VST. Async CCXT.
-  Команди:
-  - snapshot    — mark price, orderbook top-20, imbalance, баланс, позиції, ордери
-  - book <depth> — orderbook walls
-  - place <side> <posSide> <qty> <price> [tp] [sl] — лімітний ордер
-  - market <side> <posSide> <qty> — ринковий ордер
-  - set_sl <posSide> <sl> — стоп-лосс
-  - cancel_all / cancel <id> — скасування ордерів
-  - grid <lo> <hi> <n_side> <qty> — сітка ордерів + breakout
-  - trades <hours> — історія PnL
-  Вихід: stdout JSON + runtime/trade_journal.jsonl
-
-local_market_analyzer.py
-  Автономний аналізатор ринку (можна запускати окремо від watchdog).
-  Підключається до BingX testnet, тягне 1h/15m/5m OHLCV + orderbook для
-  XRP/USDT та BTC/USDT. Рахує RSI/MACD/BB/ATR без зовнішніх TA-бібліотек.
-  Відправляє дані в Ollama, записує рішення в runtime/local_analysis.json.
-
-night_autopilot.py
-  Нічний автопілот для розблокування позицій XRP/USDT.
-  Працює за 4 правилами власника.
-  Запускається через run_autopilot.sh (AP_LIVE=1).
-  Журнал: runtime/autopilot_journal.jsonl
-
-xrp_short_watch.py
-  Daemon спостереження за шорт-можливостями.
-  Ієрархія таймфреймів: 4h (контекст) → 15m (сетап) → 5m (тайминг).
-  Журнал: runtime/xrp_short_watch.jsonl
-
-supervisor_market_analysis.py
-  Аналіз для supervisor'а: TradingView technicals + BingX funding + ZMQ.
-
-supervisor_action_bc.py
-  Виконавчий скрипт: cancel ордерів + часткове покриття шорту.
-
-supervisor_readonly_probe.py
-  Read-only зондування: баланс, позиції, ордери.
-
-papertest.py
-  Симулятор паперової торгівлі: sigtest + liqmap.
-
-health_check.py
-  Діагностика: CPU/RAM + перевірка TCP портів (5555, 5560).
-
-check_zmq.py / test_zmq.py
-  Тест ZMQ підписки на MarketDataHub (TCP:5555).
-
-generate_full_context.py
-  Сканер кодобази: об'єднує source файли у контекст для LLM.
-
-Діагностичні/допоміжні (_prefix):
-  _diag_ccxt.py         — тест CCXT async сигнатур на BingX
-  _liq_probe.py         — зонд OHLCV/funding/OI доступності
-  _night_pnl.py         — PnL за останні 9 годин
-  _probe_funding.py     — funding rates + OI для XRP
-  _probe_pnl_fields.py  — дослідження полів PnL у сирих відповідях
-  _verify_ab.py         — AST верифікація core Python файлів
-  _verify_b_monitor.py  — psutil перевірка працюючих ботів
-  _verify_bc.py         — AST перевірка supervisor_action_bc.py
-
-4.3 RUNTIME (runtime/)
-──────────────────────
-Каталог живого стану системи — транзієнтні дані, сигнали, журнали.
-
-watchdog_signal.json ★ МІСТКОВИЙ ФАЙЛ
-  Сигнал пробудження від Watchdog до Hermes.
-  Формат: {wake, reason, vol_index, price_move_pct, buffer_pct, note, timestamp_utc}
-  Поточний стан: wake=false, vol_index=0.034, buffer_pct=10.84
-
-watchdog_state.json
-  Внутрішній стан Watchdog (last_price, timestamp).
-
-local_analysis.json
-  Результат local_market_analyzer.py (bias, conviction, entry/short levels).
-
-liqmap_latest.json
-  Актуальна карта ліквідацій (зони, інтенсивність, найближчі магніти).
-
-liqmap_calibration.json / liqmap_calib_2pct.json / liqmap_calibration_2pct.json
-  Калібрація liqmap-моделі.
-
-trade_journal.jsonl
-  Журнал виконаних ордерів через qe_trade.py (PnL, розміри, ціни).
-
-trader_plan.md
-  Поточний торговий план Hermes (текстовий, для Hermes + oversight).
-
-supervisor_plan.json / supervisor_plan.md
-  Плани supervisor'а.
-
-autopilot_journal.jsonl / autopilot_state.json
-  Журнал і стан нічного автопілота.
-
-composite_latest.json / composite_calibration.json
-  Дані композитних сигналів.
-
-sigtest_calibration.json
-  Калібрація индикаторного бектесту.
-
-orderflow_calibration.json / orderflow_raw/
-  Калібрація orderflow + сирі дані.
-
-agy_market_report.txt
-  Останній звіт agy.
-
-CLI_HANDOVER_BRIEF.md
-  Передача контексту між CLI-сесіями.
-
-gemma_dataset.jsonl
-  Датасет для fine-tuning Gemma.
-
-telemetry_store.jsonl
-  Телеметрія системи.
-
-telegram_session_transcript.md
-  Транскрипт Telegram-сесії.
-
-xrp_short_watch.jsonl
-  Журнал спостереження за шорт-можливостями.
-
-policy.json
-  Політики ризику та торгівлі.
-
-status/
-  Підкаталог зі статусними файлами.
-
-cache/
-  Кеш runtime.
-
-4.4 КОНФІГУРАЦІЯ (config/)
-─────────────────────────
-Системні конфігурації у YAML:
-
-risk.yaml        — ліміти ризику, макс плече, розміри позицій, поріг ліквідації
-ports.yaml       — порти мережі (ZMQ PUB/SUB: 5555, 5560)
-processes.yaml   — специфікації daemon-процесів та прапорці запуску
-lockbot.yaml     — параметри розблокування та хеджування позицій
-dca.yaml         — налаштування сітки DCA
-supervisor.yaml  — пороги рішень supervisor'а
-quantumedge_testnet.yaml — параметри BingX VST середовища
-
-4.5 МОДУЛЬНА АРХІТЕКТУРА (src/)
-──────────────────────────────
-Три Python-пакети:
-
-quantum_edge_core/
-  ├── ai_bridge.py          — Міст LLM-рішень до виконання
-  ├── events.py             — Системні події
-  ├── logging_setup.py      — Налаштування логування
-  ├── telegram_notifier.py  — Telegram алерти
-  ├── ai_scalper_bot/       — Скальпінг бот
-  ├── backtesting/          — Движок бектестингу
-  ├── bot/                  — Базові класи ботів
-  ├── config/               — Завантажувачі конфігурацій
-  ├── core/                 — Доменні об'єкти
-  ├── dashboard/            — Провайдери даних для дашборду
-  ├── dyn_dca_bot/          — Динамічний DCA бот
-  ├── lock_bot/             — Бот розблокування позицій
-  ├── market_data/          — Обробники ринкових даних + ZMQ hub
-  ├── shared/               — Спільні утиліти
-  ├── strategies/           — Реалізації стратегій
-  └── supervisor/           — Supervisor агент
-
-quantum_edge_infra/
-  ├── automation/           — Автоматизація деплою та крон
-  ├── k8s/                  — Kubernetes маніфести
-  └── tools/                — Інфраструктурні утиліти
-
-quantum_edge_ml/
-  ├── inference_engine/     — Движок ML-інференсу
-  └── model_router/         — Маршрутизація моделей
-
-4.6 ІНШІ КАТАЛОГИ
-─────────────────
-ai_scalper_bot/    — Скальпінг бот (run_bot.py, стратегії, індикатори)
-data/              — Історичні цінові дані (CSV/Parquet)
-logs/              — Логи додатків (bot.log, hub.log, quantum_edge.log)
-models/            — ML-моделі (ONNX/GGUF)
-ollama/            — Конфігурації та Modelfile для Ollama
-docs/ & Documentation/ — Документація та архітектурні специфікації
-tests/             — pytest автотести
-ui/                — Web-дашборд (HTML/JS)
-
-
-════════════════════════════════════════════════════════════════════════════════
- 5. WATCHDOG DAEMON — ДЕТАЛЬНА ЛОГІКА
-════════════════════════════════════════════════════════════════════════════════
-
-Watchdog — це АВТОНОМНИЙ процес на RTX 4060 (НЕ крон Hermes).
-Запускається як systemd user service, працює безперервно.
-
-ЦИКЛ (кожні 5 хвилин, вирівняний по годиннику):
-  1. Отримати snapshot з BingX (subprocess → qe_trade.py snapshot)
-  2. Витягти: mark_price, legs (entry/size/leverage), open_orders
-  3. Прочитати watchdog_state.json → last_price
-  4. Порахувати price_move_pct = abs(mark - last_price) / last_price * 100
-  5. Fetch 30 свічок 5m через CCXT async → порахувати vol_index
-  6. Порахувати buffer_pct = abs(mark - liq_price) / mark * 100
-     де liq_price ≈ entry * (1 - 0.95 / leverage) для LONG
-  7. Зберегти last_price → watchdog_state.json
-  8. Зібрати метрики у промпт → відправити в Ollama (hermes3:8b Q5_K_M)
-
-ПРАВИЛА ПРОБУДЖЕННЯ (wake=true):
-  scheduled_5m   → кожні 5 хвилин (поверхневий чек Hermes)
-  scheduled_15m  → на :00, :15, :30, :45 (широкий аналіз через agy)
-  vol_spike      → vol_index > 0.75 АБО price_move_pct > 1.0%
-  liq_alert      → buffer_pct < 3.0% (КРИТИЧНО)
-
-FALLBACK (Ollama недоступна):
-  Ті самі правила, але без LLM — чиста математика:
-  - minute % 15 == 0 → scheduled_15m
-  - vol_index > 0.75 → vol_spike
-  - buffer_pct < 3.0 → liq_alert
-  - інакше → scheduled_5m з wake=false
-
-ФОРМАТ СИГНАЛУ (watchdog_signal.json):
-  {
-    "wake": true/false,
-    "reason": "scheduled_5m|scheduled_15m|vol_spike|liq_alert",
-    "vol_index": 0.0-1.0,
-    "price_move_pct": 0.0,
-    "buffer_pct": 0.0,
-    "note": "пояснення рішення",
-    "timestamp_utc": "YYYY-MM-DD HH:MM:SS"
-  }
-
-
-════════════════════════════════════════════════════════════════════════════════
- 6. HERMES TRADER — ДЕТАЛЬНА ЛОГІКА
-════════════════════════════════════════════════════════════════════════════════
-
-Hermes (tencent/hy3, хмара Nous Research) — головний трейдер системи.
-Працює через hermes-gateway.service, комунікує через Telegram.
-
-ЛОГІКА КРОНУ (кожні 5 хвилин):
-  1. Прочитати runtime/watchdog_signal.json
-
-  IF wake == false AND reason == scheduled_5m:
-    → Запустити trader.py (поверхневий чек)
-    → Якщо uPnL змінився > 2% або нові ордери → короткий звіт (3 рядки)
-    → Інакше → SILENT (не відповідає)
-
-  IF wake == true:
-    IF reason == scheduled_5m:
-      → Поверхневий аналіз + корекція SL/грід/харвест
-      → Короткий звіт
-
-    IF reason == scheduled_15m OR vol_spike OR liq_alert:
-      → ШИРОКИЙ збір даних:
-        1. qe_trade.py snapshot (позиції, баланс, ордери)
-        2. latest.json (індикатори 1h/15m/5m, book, btc_context, news)
-        3. liqmap_latest.json (карта ліквідацій)
-      → Сформувати промпт для agy (5 завдань, ≤25 рядків відповіді)
-      → Виклик: agy --dangerously-skip-permissions --effort high --print
-      → Отримати аналіз від agy
-      → САМОСТІЙНО прийняти рішення → trader.py / qe_trade.py
-      → Детальний звіт (до 15 рядків)
-
-SMART STOP-LOSS (trader.py → smart_stop_loss):
-  1. Параболічний трейлінг: TRAIL_TRIGGER_PCT=0.3%, TRAIL_DIST_PCT=0.5%
-  2. Breakeven: BE_PROFIT_PCT=0.05% (мінімальний запас)
-  3. Блокування при HIGH orderbook маніпуляції
-  4. Затягування при розвороті: RSI>70 + MACD_hist<0 або пробій bid-wall
-  5. Ідемпотентність: cancel старого SL → новий (не стекінг)
-
-
-════════════════════════════════════════════════════════════════════════════════
- 7. AGY DEEP ANALYST — ВИКЛИК І ПРОМПТ
-════════════════════════════════════════════════════════════════════════════════
-
-agy (Antigravity CLI, Google Gemini) викликається ТІЛЬКИ при:
-  - wake=true + reason=scheduled_15m
-  - wake=true + reason=vol_spike
-  - wake=true + reason=liq_alert
-
-Команда виклику:
-  /home/layman/.local/bin/agy \
-    --dangerously-skip-permissions \
-    --effort high \
-    --add-dir /home/layman/QuantumEdge \
-    --add-dir /home/layman/.hermes/quantumedge_analysis \
-    --print "<промпт>"
-
-5 ЗАВДАНЬ ПРОМПТУ:
-  1. Тренд і фаза (1h + 15m): бичаче/ведмеже/нейтрально, перегрів
-  2. Сигнали на вхід/вихід + liqmap-магніти
-  3. Рекомендація для LONG XRP: тримати/фіксувати/закрити + рівні TP/SL
-  4. Чи відкривати SHORT (лише харвест, не нарощування) + рівні
-  5. Прогноз на US-сесію (13-21 UTC)
-
-Формат відповіді: укр, ≤25 рядків.
-
-
-════════════════════════════════════════════════════════════════════════════════
- 8. ПРАВИЛА ВЛАСНИКА (священні для всіх агентів)
-════════════════════════════════════════════════════════════════════════════════
-
-1. НЕ закривати збиткові позиції.
-2. Збиткову скорочувати ЛИШЕ прибутком протилежної (харвест SHORT у плюсі →
-   ADD_LONG).
-3. Індикатори в лонг → добір; рух видихся → фіксація + шорт (шорт НЕ
-   нарощувати).
-4. Високий ризик → хедж + чекати.
-5. Авто-стоп ВИМКНЕНО (захист через аналіз, не hard stop).
-6. Шорт упёрся в ліміт нотіоналу (101209) — шорт ЛИШЕ скорочувати.
-7. Лонг ≤ 1M USDT нотіоналу (room_contracts-гард, не спам 101209).
-
-
-════════════════════════════════════════════════════════════════════════════════
- 9. ВІДОМІ ПАСТКИ ТА ТЕХНІЧНІ ОСОБЛИВОСТІ
-════════════════════════════════════════════════════════════════════════════════
-
-CCXT 4.5.64:
-  - fetch_ohlcv / fetch_ticker — КОРУТИНИ (await), не sync
-  - trader.py використовує СИНХРОННИЙ об'єкт _ccxt → fetch_open_orders
-    без async/await та asyncio.run
-
-BingX VST (Testnet):
-  - Hedge-mode: cancel_all без positionSide ігнорується
-  - SL через create_order(stopLossPrice, positionSide, NO reduceOnly)
-  - Stop-ордери повертаються з типом "market"
-  - Реальна ціна тригера в info['stopPrice'] (рядок), не stopLossPrice
-
-Ліквідація:
-  - liquidationPrice на VST = None → рахувати вручну:
-    liq ≈ entry * (1 - 0.95 / leverage) для LONG
-
-Ollama:
-  - CUDA бібліотеки: LD_LIBRARY_PATH=/home/layman/.local/lib/ollama/cuda_v13
-  - Не має інтернету/новин → глибокий аналіз ТІЛЬКИ через agy
-
-Ліміти:
-  - 1M USDT капітал на ногу → room_contracts-гард перед добором
-  - Nous API rate limit: RPM=400, TPM=4M
-  - OpenRouter fallback (gemma-4-31b-it:free) → часто 429
-
-
-════════════════════════════════════════════════════════════════════════════════
-10. ПОТОЧНИЙ СТАН СИСТЕМИ (на момент аудиту)
-════════════════════════════════════════════════════════════════════════════════
-
-Дата аудиту: 2026-07-21 15:59 EEST (12:59 UTC)
-
-Watchdog daemon:  ✓ ACTIVE (PID 31352, цикл ~20хв безперебійно)
-Hermes gateway:   ✓ ACTIVE (PID 31420, Telegram connected)
-Ollama server:    ✓ ACTIVE (hermes3:8b-llama3.1-q5_K_M завантажена)
-agy binary:       ✓ PRESENT (/home/layman/.local/bin/agy)
-
-Поточний сигнал watchdog:
-  wake=false, reason=scheduled_5m, vol_index=0.034, buffer_pct=10.84
-  → Ринок спокійний, ліквідаційних загроз немає.
-
-Стан trader:
-  cycle=391, last_bias=LONG, grid_active=false
-
-Крони Hermes (активні в jobs.json):
-  - Job 1: 02c3d45bd603 (QE Trader, 5m, active)
-  - Job 2: 8ea10dca157c (QE Trader Deep Oversight, 15m, active)
-
-Останні дії журналу:
-  TRAIL_TRAIL — коригування long SL до 1.1313
-  BREAKOUT_UP_SKIP — заблоковано добір (room_contracts ≤ 1000, 1M кап)
-
-
-════════════════════════════════════════════════════════════════════════════════
- КІНЕЦЬ ДОКУМЕНТУ
- FULL_SYSTEM_CONTEXT.txt
- Версія: 1.0 | Аудит: 2026-07-21
-════════════════════════════════════════════════════════════════════════════════
+===============================================================================
+QUANTUMEDGE & HERMES SYSTEM - FULL SYSTEM CONTEXT & AUDIT
+===============================================================================
+Дата створення/оновлення: 2026-07-22
+Призначення: Повний аудит торгових файлів, конфігурацій, логіки та зв'язків 
+системи QuantumEdge в директорії /home/layman/.hermes та /home/layman/.hermes/quantumedge_analysis/
+для безпечної міграції на новий сервер та повноцінного аналізу.
+
+-------------------------------------------------------------------------------
+1. АРХІТЕКТУРА СИСТЕМИ ТА КЛЮЧОВІ ПАПКИ
+-------------------------------------------------------------------------------
+Система складається з двох основних контурів:
+1) /home/layman/.hermes/quantumedge_analysis/  - ГОЛОВНИЙ АВТОНОМНИЙ ТРЕЙДИНГОВИЙ КОНТУР.
+2) /home/layman/.hermes/                        - Системне середовище Hermes Agent (конфіги, ключі, база даних).
+
+-------------------------------------------------------------------------------
+2. ДЕТАЛЬНИЙ АУДИТ ФАЙЛІВ ТРЕЙДИНГОВОГО КОНТУРУ (/home/layman/.hermes/quantumedge_analysis/)
+-------------------------------------------------------------------------------
+
+[trader.py]
+- РОЛЬ: Головний торговий оркестратор системи.
+- ПРИЗНАЧЕННЯ: Запускається кроном кожні 15 хвилин. 
+  1. Збирає ринкову аналітику через market_analysis.py.
+  2. Формує мульти-активний промпт (XRP, BTC, SOL + крос-пари BTC/SOL, BTC/XRP).
+  3. Включає протокол розторгування «Замка» (Hedged Lock Resolution) та адаптивну стратегію SOL (DCA Scalp).
+  4. Викликає хмарний ШІ Google Antigravity через CLI команду `agy --model "Gemini 3.6 Flash (Low)"`.
+  5. Парсить згенерований ШІ JSON-блок торгових команд та виконує їх через tools/qe_trade.py.
+  6. Формує лаконічний HTML-звіт і надсилає його в Telegram через Bot API.
+- ЗВ'ЯЗКИ: Залежить від market_analysis.py, tools/qe_trade.py, .env, agy CLI.
+
+[market_analysis.py]
+- РОЛЬ: Аналітичний мозок системи (Трейдер-Маркет-Мейкер).
+- ПРИЗНАЧЕННЯ: Зчитує дані індикаторів та біржі, проводить аналіз:
+  - Раннього виявлення зміни тренду (MACD-перелом, Bollinger Squeeze, RSI дивергенції, LH/LL swing structure).
+  - Маніпуляцій стаканом (spoofing, absorption, imbalance, стіни ордерів).
+  - Макро-динаміки BTC/SOL/XRP та розрахунок співвідношень крос-пар BTC/SOL та BTC/XRP.
+  - Оцінки новинного фону та рейтингу TradingView.
+- ЗВ'ЯЗКИ: Залежить від indicators.py, market_data.py.
+
+[market_data.py]
+- РОЛЬ: Прямий збирач біржових даних у реальному часі.
+- ПРИЗНАЧЕННЯ: Отримує свіжі свічки (klines), funding rate, open interest, тикери та стакан ордерів для BTC, SOL, XRP напряму з біржі BingX VST через бібліотеку CCXT.
+- ЗВ'ЯЗКИ: Використовує ключі з .env, підключається до BingX VST Sandbox.
+
+[indicators.py]
+- РОЛЬ: Математичний блок технічного аналізу.
+- ПРИЗНАЧЕННЯ: Обчислює індикатори MACD, Bollinger Bands, RSI, EMA, ATR, trend score для pandas DataFrames.
+
+[tools/qe_trade.py]
+- РОЛЬ: Виконавчий механізм торгових ордерів.
+- ПРИЗНАЧЕННЯ: Приймає CLI-команди (`snapshot`, `place`, `market`, `cancel`, `set_sl`) з підтримкою специфікації монети (XRP, BTC, SOL) і торгує на BingX VST через CCXT.
+- ЗВ'ЯЗКИ: Зчитує credentials з .env, надсилає ордери в REST API BingX.
+
+[.env]
+- РОЛЬ: Центральне сховище конфігураційних змінних та ключів доступу.
+- ПРИЗНАЧЕННЯ:
+  - BINGX_TESTNET_API_KEY / BINGX_TESTNET_SECRET: ключі для торгової біржі.
+  - TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID: токен та чат-ID для відправки статус-звітів.
+  - AGY_MODEL="Gemini 3.6 Flash (Low)": вибір моделі ШІ для виконання рішень.
+
+[trader_state.json]
+- РОЛЬ: Збереження поточного стану виконання (State Management).
+- ПРИЗНАЧЕННЯ: Містить номер поточного циклу (cycle #423+), останій ринковий біас та сумарні метрики.
+
+[trader_journal.jsonl]
+- РОЛЬ: Журнал аудиту всіх виконаних угод та дій (Audit Log).
+- ПРИЗНАЧЕННЯ: Логує у форматі JSON Lines кожне відкриття, закриття, виставлення лімітки, PnL та параметри виконання.
+
+[venv/]
+- РОЛЬ: Ізольоване середовище Python 3.10+.
+- ПРИЗНАЧЕННЯ: Містить усі необхідні бібліотеки (`ccxt`, `pandas`, `python-dotenv`, `requests`).
+
+-------------------------------------------------------------------------------
+3. АУДИТ СИСТЕМНОЇ ПАПКИ HERMES AGENT (/home/layman/.hermes/)
+-------------------------------------------------------------------------------
+- [config.yaml]: Повний файл конфігурації для Hermes Agent / шлюзу Telegram Bot.
+- [auth.json]: Збережені OAuth та API ключі агентів.
+- [SOUL.md]: Опис системної особистості та базових інструкцій Гермеса.
+- [state.db]: База даних SQLite локальної пам'яті (зараз вимкнена для вивільнення RAM).
+
+-------------------------------------------------------------------------------
+4. ІНСТРУКЦІЯ ДЛЯ МІГРАЦІЇ НА НОВИЙ СЕРВЕР
+-------------------------------------------------------------------------------
+1. Скопіювати папки:
+   - `~/.hermes/quantumedge_analysis/` (весь трейдинговий код, `.env`, `venv`).
+   - `~/.gemini/` (для збереження токенів авторизації Antigravity та файлів settings.json).
+2. На новому сервері перевірити працездатність Python venv:
+   `/home/layman/.hermes/quantumedge_analysis/venv/bin/python3 -c "import ccxt, pandas; print('OK')"`
+3. Запустити тестовий торговий цикл:
+   `/home/layman/.hermes/quantumedge_analysis/venv/bin/python3 /home/layman/.hermes/quantumedge_analysis/trader.py`
+4. Налаштувати фоновий крон-таймер на 15 хвилин:
+   `schedule(CronExpression="*/15 * * * *", Prompt="Run trader.py cycle")`
+===============================================================================
