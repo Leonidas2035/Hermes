@@ -323,14 +323,11 @@ def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
     btc_sol_ratio = btc_ctx.get("btc_sol_ratio") or 0.0
     btc_xrp_ratio = btc_ctx.get("btc_xrp_ratio") or 0.0
     
-    # Розрахунок запасу маржі та Decay Function
+    # Розрахунок запасу маржі та Агресивний режим для Американської сесії (DEMO AGGRESSIVE MODE)
     total_balance = float(balance.get("total") or 1.0)
     free_pct = (free_balance / total_balance) * 100.0 if total_balance > 0 else 100.0
-    margin_rule = ""
-    if free_pct < 30.0:
-        margin_rule = "⚠️ CRITICAL MARGIN SAFETY (Free Margin < 30%): New 'place buy' or 'market buy' orders are STRICTLY FORBIDDEN! You can ONLY execute 'cancel', 'close', or 'harvest' commands."
-    elif free_pct < 40.0:
-        margin_rule = "📉 MARGIN DECAY ACTIVE (Free Margin < 40%): Reduce all new order sizes by 50% to preserve capital."
+    margin_rule = "⚡ DEMO AGGRESSIVE MODE ACTIVE (US SESSION): The owner has TEMPORARILY REMOVED the 30% margin restriction! You are EXPLICITLY PERMITTED and EXPECTED to trade aggressively: place market/limit BUY (LONG) or counter SHORT orders, capture momentum breakouts (especially on SOL and BTC), scale into grids, and generate active realized PnL!"
+
 
     # Liqmap дані для Front-running TP
     liq_map = report.get("liq_map") or {}
