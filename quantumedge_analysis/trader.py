@@ -357,8 +357,9 @@ You must analyze the multi-asset market state (XRP, BTC, SOL) and output precise
 {margin_rule}
 
 ### HERMES TRADING DNA v2.0 RULES:
-1. NEVER close a losing position manually if uPnL < 0. Shrink losing legs ONLY via profit harvesting (net realized PnL >= 0).
+1. PARTIAL REDUCTION & RE-ACCUMULATION PROTOCOL (NEW): Never close a losing position completely. However, you ARE ALLOWED to partially reduce/trim a losing leg (e.g. 20%-40%) near key resistance/support or momentum exhaustion to mitigate drawdown, PROVIDED you immediately place a re-entry DCA grid at a better price (lower for LONG, higher for SHORT). The profit from the re-accumulated position MUST offset the initial reduction loss and bring the total leg into net positive PnL!
 2. Auto-stop is OFF.
+
 3. Order TTL (Time-to-Live): Cancel any limit order if price moved > 2.0% away from the order price.
 4. Breakeven Lock: When Unrealized PnL reaches >= +1.0%, lock profit by target stop at entry * 1.001.
 5. Counter-Trade Permission: Opening counter SHORT positions on rallies is ALLOWED near Ask Walls / Resistance / RSI > 70. Set active Take-Profit targets (+1.0% to +1.5%). Avoid dead 1-to-1 locks.
