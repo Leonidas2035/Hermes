@@ -1,53 +1,42 @@
-# QuantumEdge — Дистиляція сесії (для відновлення після reboot)
-Дата: 2026-07-22 ~09:50 EEST
+# QuantumEdge — Дистиляція сесії та Пам'ять системи (Оновлено 2026-07-23)
 
-## РЕЖИМ (ГОЛОВНЕ)
-- ТОРГУЄМО НАЖИВО. Всі 3 крони PAUSED: 258abcced588 (будильник), 02c3d45bd603, 8ea10dca157c.
-- Причина: cron-сесія = "мозок з амнезією" (нова сесія Hermes без контексту розмови, читає лише сухий промпт → торгує шаблонно, метушиться). Живий діалог (з повним контекстом + Tencent/hy3 + факт-чек) торгує якісніше.
-- НЕ вмикати крони без явної команди власника.
+## 📌 ПОТОЧНИЙ РЕЖИМ І АРХІТЕКТУРА ТОРГІВЛІ
+- **Основний Виконавчий контур:** Автономний 5-хвилинний системний Linux Crontab (`*/5 * * * *`).
+- **Скрипт-Оркестратор:** `/home/layman/.hermes/quantumedge_analysis/cron_15m_agy.sh` -> `trader.py`.
+- **Головний AI Мозок (AGY):** Antigravity CLI з моделлю **`Gemini 3.6 Flash (High)`** (прямий виклик `agy --model "Gemini 3.6 Flash (High)"`).
+- **Hermes Gateway:** Вимкнений/призупинений. Вся торгівля переведена на Antigravity AGY з прямою відправкою звітів у Telegram.
+- **Пам'ять (Memory Persistence):** Функція `get_recent_actions()` підтягує останні 5 дій з `trader_journal.jsonl`, що повністю ліквідувало "амнезію" та зациклені заміни ордерів.
 
-## ПІДСУМОК НІЧНОЇ АВТОНОМІЇ (урок)
-- Будильник за ніч: 51 дія (place 22, cancel 24, modify_sl 5), close = 0.
-- Реалізований профіт за ніч = 0 (біржа: `qe_trade.py trades 12` → realized_pnl 0.0).
-- Приріст балансу 576k→654k = НЕ прибуток, а рух equity (uPnL short + маржа), паперовий.
-- Висновок: багато метушні, нуль фіксації. Автономний cron у режимі активного трейдера працює гірше.
+---
 
-## ПОЗИЦІЯ (на момент дистиляції)
-- LONG 700 002 @1.1594, uPnL ~ -19 000 (глибоко в мінусі, XRP впав)
-- SHORT 350 000 @1.1316, uPnL ~ -200 (майже BE)
-- Баланс: total ~654k / free ~250k / used(маржа) ~404k
-- XRP ~1.1316, BTC(BingX) ~65 914
-- Відкриті ордери: sell 350k@1.16, sell 350k@1.163 (long TP), buy 150k@1.125, buy 200k@1.113 (long DCA/short TP)
+## 📋 ОНОВЛЕНИЙ МАНІФЕСТ ТРАНСФОРМАЦІЇ (HERMES TRADING DNA v3.0)
+Збережено у `/home/layman/.hermes/SOUL.md`:
+1. **VWAP & StochRSI:** 
+   - **VWAP:** Фіксація справедливої ціни. Набір LONG суворо пріоритетний у зону уцінки (`Price < VWAP`).
+   - **StochRSI (5m/15m):** Снайперський виклик екстремумів (<20 для дна, >80 для вершини) для розстановки DCA та скальпінгу.
+2. **Min ROI Gate (SOL):**
+   - Заборонено передчасний panic-close позиції SOL LONG по маркету за дрібний прибуток. Мінімальний поріг закриття в мікро-скальпі: **>= +1.5% ROI per trade**. Тейк-профіти виставляються на рівнях **$79.10** та **$80.30**.
+3. **BingX Protection & Harvesting:**
+   - Жодна збиткова позиція не закривається повністю в мінус (Rule #1).
+   - Скорочення збиткових ног здійснюється лише через парний харвест із прибутку протилежної legs + `reduceOnly=True` для запобігання помилок 101209/109400.
+4. **Drawdown Micro-Scalping (Rule #4):**
+   - При просадках вільна маржа (ліміт вільної маржі = 10%) задіюється під бліц-скальпи за сигналами StochRSI, а прибуток йде на відкушування основного мінуса.
 
-## КАРТА ЛІКВІДАЦІЙ (свіжа, BTC, ціна 65916)
-- ВГОРУ (шорт-ліквідації, магніти): 67074 (int 1.0, +1.78% НАЙСИЛЬНІШИЙ), 67536 (0.90), 67882 (0.60)
-- ВНИЗУ (лонг-ліквідації): 65691 (0.36, -0.32%), 65345 (0.45, -0.85%)
-- Читання: сильніший магніт ВГОРУ → ставка на відскок, але можливий стоп-хант вниз (65345) спершу.
-- XRP стакан: підтримка bid-стіна 1.1285-1.1291 (~1.4M XRP, міцна), опір ask 1.134-1.1349 (~1M). Imbalance -0.143.
-- Індикатори XRP: RSI 32.9 (BEARISH/перепроданий), MACD BEARISH, BB_pos 0.12 (біля нижньої).
+---
 
-## ТОРГОВІ ІДЕЇ (обговорені, НЕ виконані — чекають команди)
-1. ГОЛОВНА: карта=магніт вгору 67074 + RSI перепроданий → відскок. Тримати long 700k, short як страховка; при відбої від 1.1285 фіксувати short у профіт, long відпливає з мінусу.
-2. СКАЛЬП дна: long 100-150k @1.1285-1.1290 (bid-стіна) TP 1.134 (ask) — реальний профіт, покриває просадку long.
-3. DCA long: при проколі до 1.125-1.128 долив 150k (ордер buy 150k@1.125 вже стоїть) — знизити середню.
-4. SHORT-харвест: якщо XRP пробиває 1.1285 вниз → short 350k у профіт, фіксувати (rule #2).
-- РЕКОМЕНДАЦІЯ: тримати long (rule#1), скальп-long від 1.1285, short тримати як страховку.
+## 📊 СТАН АКАУНТА ТА ПОЗИЦІЙ (Станом на 2026-07-23 14:30 EEST)
+- **Баланс (BingX VST):** Total `~566,500 VST` | Free `~84,600 VST` (15% free margin buffer).
+- **XRP LONG:** `912,417 XRP` @ `1.1501` (mark `1.1352`, uPnL `-13,621 VST`).
+- **XRP SHORT (Harvest):** `611,928 XRP` @ `1.1352` (uPnL `+30 VST`). Частково виконано TP-ордер на 300,000 XRP @ `1.1365`.
+- **SOL LONG:** Серія DCA-ордерів із цільовими ТР на **$79.10** та **$80.30**.
+- **BTC Context:** Торгується біля **$65,745**. Магніт шорт-ліквідацій знаходиться на **$66,978 (+1.89%)**, що готує імпульс вгору на US-сесії.
 
-## ВІДКЛАДЕНЕ ЗАВДАННЯ
-- Написати сильний SOUL.md (~/.hermes/SOUL.md зараз порожній/дефолтний) — трейдерська ДНК QuantumEdge: правила власника, читання ліквідацій/стакану, дисципліна (менше метушні, якісні входи). Щоб будь-яка сесія стартувала "трейдером", а не чистим аркушем.
+---
 
-## ІНСТРУМЕНТИ (перевірені)
-- BTC ціна з BingX: `cd /home/layman/QuantumEdge && MARKET_DATA_SYMBOLS=BTCUSDT .venv/bin/python3 tools/qe_trade.py snapshot` → mark_price. (НЕ Kraken/CoinGecko.)
-- Realized PnL: `.venv/bin/python3 tools/qe_trade.py trades <hours>`
-- Liqmap build (хардкодить BTC): `cd /home/layman/QuantumEdge && .venv/bin/python3 -m tools.liqmap.cli build --tf 1h --limit 500` → runtime/liqmap_latest.json + liqmap_dashboard.html
-- Індикатори: `cd /home/layman/.hermes/quantumedge_analysis && /home/layman/QuantumEdge/.venv/bin/python3 analysis.py` → latest.json
-- Browser Use працює (TradingView скрейп OK).
-- agy: `/home/layman/.local/bin/agy --dangerously-skip-permissions --effort high --add-dir /home/layman/QuantumEdge --add-dir /home/layman/.hermes/quantumedge_analysis --print "<промпт>"`
-- Ollama: systemd user-unit (автостарт після reboot; перевірити `systemctl --user is-active ollama.service` після reboot).
-
-## ПІСЛЯ REBOOT — ПЕРШІ КРОКИ
-1. Перевірити Ollama: `systemctl --user is-active ollama.service` (для watchdog, якщо треба).
-2. snapshot XRP + BTC(BingX) + свіжий liqmap + analysis.py.
-3. Порівняти позицію з цим файлом (long 700k, short 350k мали лишитись — ордери на біржі живуть після reboot).
-4. Крони ЗАЛИШАЮТЬСЯ paused (торгуємо наживо), доки власник не скаже інакше.
-5. Чекати команду власника по торговій ідеї.
+## 📁 КЛЮЧОВІ ФАЙЛИ ТА ШЛЯХИ
+- `FULL_SYSTEM_CONTEXT.txt`: `/home/layman/.hermes/quantumedge_analysis/FULL_SYSTEM_CONTEXT.txt`
+- `SOUL.md` (Маніфест v3.0): `/home/layman/.hermes/SOUL.md`
+- `Торговий план`: `/home/layman/.hermes/quantumedge_analysis/runtime/trader_plan.md`
+- `Стартовий промпт`: `/home/layman/Desktop/START_TRADING_PROMPT.md`
+- `Код оркестрації`: `/home/layman/.hermes/quantumedge_analysis/trader.py`
+- `Код індикаторів`: `/home/layman/.hermes/quantumedge_analysis/indicators.py`

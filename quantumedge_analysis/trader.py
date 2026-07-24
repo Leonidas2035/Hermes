@@ -13,12 +13,15 @@ QuantumEdge — AUTONOMOUS TRADER (Hermes Market-Maker brain)
   4. Високий ризик → хедж + чекати.
   5. Авто-стоп ВИМКНЕНО — захист через аналіз + цей контур.
   6. Шорт уперся в ліміт нотіоналу (ccxt 101209) — шорт ЛИШЕ скорочувати.
+  7. Min ROI Gate (SOL): Не закривати LONG-позицію SOL менше ніж на +1.5% ROI per trade.
 
 РЕЖИМ: демо (BingX VST). Реальні ордери на рахунку VST.
 ================================================================
 """
 from __future__ import annotations
 import json
+import os
+import re
 import subprocess
 import sys
 import time
@@ -68,235 +71,38 @@ def save_state(s: dict):
 
 
 # =====================================================================
-# SKILLS-BASED SIGNAL (інтеграція liqmap + sigtest)
-# Правило власника: 3 індикатори в один бік + ліквідність карти в тому ж
-# напрямку -> сигнал. Вхід з ТП+СЛ, трейлінг до BE при безпечній відстані.
+# CONTEXTUAL MEMORY BUILDER (Оптимізація для усунення 'амнезії' у 5m)
 # =====================================================================
-import numpy as np
-import pandas as pd
-import ccxt as _ccxt
-
-def _load_market_state(symbol: str = "BTC/USDT:USDT", limit: int = 200) -> dict:
-    """Живі OHLCV + поточна ціна з BingX (публічні)."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except Exception:
-        pass
-    ex = _ccxt.bingx({"enableRateLimit": True})
-    ohlcv = ex.fetch_ohlcv(symbol, "1h", limit=limit)
-    ticker = ex.fetch_ticker(symbol)
-    return {"ohlcv": ohlcv, "last": float(ticker["last"])}
-
-
-def skills_signal(symbol: str = "BTC/USDT:USDT") -> dict:
-    """Синтез сигналу за скілами. Повертає bias + близьку зону + впевненість."""
-    try:
-        sys.path.insert(0, str(QE / "tools"))
-        from sigtest.indicators import enrich
-        from liqmap.model import build_heatmap, _extract_zones
-
-        st = _load_market_state(symbol)
-        ohlcv = st["ohlcv"]
-        last = st["last"]
-        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-        df = enrich(df)
-        r = df.iloc[-1]
-
-        # --- 3+ індикатори в один бік ---
-        long_votes = short_votes = 0
-        if r.ema9 > r.ema21 > r.ema50: long_votes += 1
-        elif r.ema9 < r.ema21 < r.ema50: short_votes += 1
-        if r.macd_hist > 0: long_votes += 1
-        else: short_votes += 1
-        if r.rsi > 55: long_votes += 1
-        elif r.rsi < 45: short_votes += 1
-        if r.obv_slope > 0: long_votes += 1
-        else: short_votes += 1
-        ind_bias = "LONG" if long_votes >= 3 else ("SHORT" if short_votes >= 3 else "NEUTRAL")
-
-        # --- карта ліквідацій: близька зона <=2% ---
-        heat = build_heatmap(ohlcv, price_bins=140)
-        prof = np.array(heat["grid"])[:, -1]
-        cen = np.array(heat["price_levels"])
-        zones = _extract_zones(prof, cen, last, top=8)
-        near = [z for z in zones if abs(z["dist_pct"]) <= 2.0]
-        long_z = [z for z in near if z["side"] == "LONG_LIQ"]
-        short_z = [z for z in near if z["side"] == "SHORT_LIQ"]
-
-        # сигнал: індикатори + ліквідність в тому ж боці
-        target = None
-        if ind_bias == "SHORT" and long_z:
-            z = min(long_z, key=lambda x: abs(x["dist_pct"]))
-            target = {"side": "SHORT", "entry_bias": "short", "tp": z["price"], "zone_dist": z["dist_pct"]}
-        elif ind_bias == "LONG" and short_z:
-            z = min(short_z, key=lambda x: abs(x["dist_pct"]))
-            target = {"side": "LONG", "entry_bias": "long", "tp": z["price"], "zone_dist": z["dist_pct"]}
-
-        return {
-            "ind_bias": ind_bias, "long_votes": long_votes, "short_votes": short_votes,
-            "near_zones": near, "target": target, "price": last,
-            "exit_rules": {
-                "long": {"rsi": 70, "macd_hist": 0},
-                "short": {"rsi": 30, "macd_hist": 0}
-            },
-            "indicators": {
-                "rsi": float(r.rsi) if hasattr(r, "rsi") and not pd.isna(r.rsi) else 50.0,
-                "macd_hist": float(r.macd_hist) if hasattr(r, "macd_hist") and not pd.isna(r.macd_hist) else 0.0
-            }
-        }
-    except Exception as e:
-        return {
-            "error": str(e)[:200],
-            "ind_bias": "NEUTRAL",
-            "exit_rules": {
-                "long": {"rsi": 70, "macd_hist": 0},
-                "short": {"rsi": 30, "macd_hist": 0}
-            },
-            "indicators": {
-                "rsi": 50.0,
-                "macd_hist": 0.0
-            }
-        }
-
-
-# --- SMART STOP-LOSS CONFIGURATION ---
-TRAIL_TRIGGER_PCT = 0.3
-TRAIL_DIST_PCT = 0.5
-BE_PROFIT_PCT = 0.05
-SL_TIGHTEN_ON_REVERSAL = True
-
-def get_raw_open_orders() -> list:
-    import os
-    from dotenv import load_dotenv
-    load_dotenv(Path("/home/layman/QuantumEdge/.env"))
-    ak = os.getenv("BINGX_TESTNET_API_KEY") or os.getenv("BINGX_API_KEY", "")
-    sc = os.getenv("BINGX_TESTNET_SECRET") or os.getenv("BINGX_SECRET", "")
-    ex = _ccxt.bingx({
-        "apiKey": ak,
-        "secret": sc,
-        "options": {"defaultType": "swap"},
-        "enableRateLimit": True,
-        "timeout": 30000
-    })
-    if str(os.getenv("USE_TESTNET", "1")).lower() in {"1", "true", "t"}:
-        ex.set_sandbox_mode(True)
-    try:
-        symbol = os.getenv("MARKET_DATA_SYMBOLS", "XRPUSDT").split(",")[0]
-        base = symbol.replace("USDT","")
-        ccxt_symbol = f"{base}/USDT:USDT"
-        orders = ex.fetch_open_orders(ccxt_symbol)
-        return orders
-    except Exception as e:
-        print(f"[TRADER] Failed to fetch raw open orders: {e}")
-        return []
-    finally:
+def get_recent_actions(limit: int = 5) -> list:
+    """Зчитує останні N дій з журналу угод для запобігання циклічних замін ордерів"""
+    recent = []
+    if JOURNAL.exists():
         try:
-            ex.close()
+            with open(JOURNAL, "r") as f:
+                lines = f.readlines()
+                for line in reversed(lines):
+                    line = line.strip()
+                    if line:
+                        try:
+                            d = json.loads(line)
+                            recent.append(d)
+                            if len(recent) >= limit:
+                                break
+                        except Exception:
+                            continue
         except Exception:
             pass
-
-def smart_stop_loss(snap, price, indicators: dict = None, book: dict = None, manip: dict = None, conviction: float = 1.0):
-    try:
-        actions = []
-        raw_orders = get_raw_open_orders()
-        for leg in snap.get("legs", []):
-            if leg["size"] <= 0:
-                continue
-            entry = leg["entry"]
-            if not entry:
-                continue
-            u = leg["uPnL"]
-            if u <= 0:
-                continue
-                
-            pos_side = leg["side"]
-            if pos_side == "long":
-                base_sl = entry * (1.0 + BE_PROFIT_PCT / 100.0)
-                move_pct = (price - entry) / entry * 100.0
-            else:
-                base_sl = entry * (1.0 - BE_PROFIT_PCT / 100.0)
-                move_pct = (entry - price) / entry * 100.0
-                
-            reversal = False
-            if SL_TIGHTEN_ON_REVERSAL and indicators:
-                rsi = indicators.get("rsi")
-                macd_hist = indicators.get("macd_hist")
-                if pos_side == "long":
-                    if rsi is not None and rsi > 70 and macd_hist is not None and macd_hist < 0:
-                        reversal = True
-                else:
-                    if rsi is not None and rsi < 30 and macd_hist is not None and macd_hist > 0:
-                        reversal = True
-            
-            manip_hold = False
-            if manip and manip.get("severity") == "HIGH" and conviction < 0.6:
-                manip_hold = True
-                
-            new_sl = base_sl
-            if reversal:
-                new_sl = base_sl
-            elif manip_hold:
-                new_sl = base_sl
-            elif move_pct >= TRAIL_TRIGGER_PCT:
-                if pos_side == "long":
-                    trail_sl = price * (1.0 - TRAIL_DIST_PCT / 100.0)
-                    new_sl = max(base_sl, trail_sl)
-                else:
-                    trail_sl = price * (1.0 + TRAIL_DIST_PCT / 100.0)
-                    new_sl = min(base_sl, trail_sl)
-                    
-            existing_sls = []
-            for o in raw_orders:
-                info = o.get("info", {})
-                is_sl = False
-                if o.get("type") in ("stop", "trigger") or o.get("stopLossPrice") is not None or o.get("triggerPrice") is not None:
-                    is_sl = True
-                elif info.get("stopLossPrice") or info.get("triggerPrice") or info.get("stopPrice") or info.get("type") == "STOP_MARKET":
-                    is_sl = True
-                
-                pos_side_info = info.get("positionSide", "").upper()
-                if is_sl and pos_side_info == pos_side.upper():
-                    trig = o.get("stopLossPrice") or info.get("stopPrice")
-                    if trig is not None:
-                        try:
-                            trig = float(trig)
-                        except ValueError:
-                            pass
-                    existing_sls.append((o.get("id"), trig))
-                    
-            new_sl_rounded = round(new_sl, 4)
-            if len(existing_sls) == 1:
-                curr_id, curr_trig = existing_sls[0]
-                if curr_trig is not None and abs(curr_trig - new_sl_rounded) < 0.0001:
-                    continue
-                    
-            qe(["modify_sl", pos_side, str(new_sl_rounded)])
-        return {"ok": True}
-    except Exception as e:
-        return {"modified": False, "error": str(e)}
-
-
+    return list(reversed(recent))
 
 
 # =====================================================================
-# РІШЕННЯ ТРЕЙДЕРА
+# ДИСПАТЧЕР РІШЕНЬ (Зчитує ринок + Antigravity)
 # =====================================================================
 def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
-    """
-    Делегує прийняття рішень великій моделі Antigravity (2T+) через agy CLI.
-    Отримує перелік торгових команд у форматі JSON, парсить їх та виконує.
-    """
-    import re
-    import os
-    
-    verdict = report["verdict"]
-    tech = report["technicals"]
-    levels = report["levels"]
-    manip = report["manipulation"]
-    trend = report["trend_shift"]
-    book = report["order_book"]
-    price = levels["price"]
+    price = report["levels"]["price"]
+    book = report.get("order_book", {})
+    tech = report.get("technicals", {})
+    verdict = report.get("verdict", {})
     bias = verdict["bias"]
     conviction = verdict["conviction"]
 
@@ -314,8 +120,7 @@ def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
     balance = snap.get("balance", {})
     free_balance = float(balance.get("free") or 0)
     
-    # 2. Отримуємо макро-контекст по крос-парам (BTC/SOL, BTC/XRP)
-
+    # 2. Отримуємо макро-контекст по крос-парам
     btc_ctx = report.get("btc") or {}
     btc_price = btc_ctx.get("btc_last") or 0.0
     sol_price = btc_ctx.get("sol_last") or 0.0
@@ -323,73 +128,55 @@ def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
     btc_sol_ratio = btc_ctx.get("btc_sol_ratio") or 0.0
     btc_xrp_ratio = btc_ctx.get("btc_xrp_ratio") or 0.0
     
-    # Розрахунок запасу маржі та Агресивний режим для Американської сесії (DEMO AGGRESSIVE MODE)
     total_balance = float(balance.get("total") or 1.0)
     free_pct = (free_balance / total_balance) * 100.0 if total_balance > 0 else 100.0
-    margin_rule = "⚡ DEMO AGGRESSIVE MODE ACTIVE (US SESSION): The owner has TEMPORARILY REMOVED the 30% margin restriction! You are EXPLICITLY PERMITTED and EXPECTED to trade aggressively: place market/limit BUY (LONG) or counter SHORT orders, capture momentum breakouts (especially on SOL and BTC), scale into grids, and generate active realized PnL!"
+    margin_rule = "⚡ DEMO AGGRESSIVE MODE ACTIVE (US SESSION): Margin limit relaxed to 10% free margin buffer!"
 
+    # 3. Зчитуємо останні 5 дій з журналу пам'яті
+    recent_actions = get_recent_actions(5)
 
-    # Liqmap дані для Front-running TP
-    liq_map = report.get("liq_map") or {}
-
-    # 3. Будуємо промпт для Antigravity з HERMES TRADING DNA v2.0
-    prompt = f"""You are the 2T+ Antigravity Trading Brain operating under HERMES TRADING DNA v2.0.
+    # 4. Будуємо розширений контекстний промпт для Antigravity
+    prompt = f"""You are the 2T+ Antigravity Trading Brain operating under HERMES TRADING DNA v3.0.
 You must analyze the multi-asset market state (XRP, BTC, SOL) and output precise execution commands.
 
 ### ACTIVE TRADING PAIRS:
-- XRPUSDT
-- BTCUSDT
-- SOLUSDT
+- XRPUSDT | BTCUSDT | SOLUSDT
 
 ### CROSS-PAIR RATIOS & PRICES:
 - BTC/USDT: {btc_price} (24h: {btc_ctx.get('btc_change24')}%)
 - SOL/USDT: {sol_price} (24h: {btc_ctx.get('sol_change24')}%)
 - XRP/USDT: {xrp_price} (24h: {btc_ctx.get('xrp_change24')}%)
-- BTC/SOL Ratio: {btc_sol_ratio}
-- BTC/XRP Ratio: {btc_xrp_ratio}
-
-### LIQUIDATION MAP MAGNETS (LIQMAP FRONT-RUNNING):
-- Data: {json.dumps(liq_map, indent=2, default=str)}
-- Target Rule: Place Take-Profit orders 0.1% BEFORE major short liquidation magnets or Ask Walls to ensure guaranteed fill before liquidity exhaustion.
+- BTC/SOL Ratio: {btc_sol_ratio} | BTC/XRP Ratio: {btc_xrp_ratio}
 
 ### MARGIN STATUS & DECAY RULE:
 - Total Balance: {total_balance:.2f} VST | Free Balance: {free_balance:.2f} VST ({free_pct:.1f}% free)
 {margin_rule}
 
-### HERMES TRADING DNA v2.0 RULES:
-1. PARTIAL REDUCTION & RE-ACCUMULATION PROTOCOL (NEW): Never close a losing position completely. However, you ARE ALLOWED to partially reduce/trim a losing leg (e.g. 20%-40%) near key resistance/support or momentum exhaustion to mitigate drawdown, PROVIDED you immediately place a re-entry DCA grid at a better price (lower for LONG, higher for SHORT). The profit from the re-accumulated position MUST offset the initial reduction loss and bring the total leg into net positive PnL!
-2. Auto-stop is OFF.
+### 🧠 RECENT EXECUTED ACTIONS (LAST 5 CYCLES / MEMORY PERSISTENCE):
+{json.dumps(recent_actions, indent=2, default=str)}
 
-3. Order TTL (Time-to-Live): Cancel any limit order if price moved > 2.0% away from the order price.
-4. Breakeven Lock: When Unrealized PnL reaches >= +1.0%, lock profit by target stop at entry * 1.001.
-5. Counter-Trade Permission: Opening counter SHORT positions on rallies is ALLOWED near Ask Walls / Resistance / RSI > 70. Set active Take-Profit targets (+1.0% to +1.5%). Avoid dead 1-to-1 locks.
-6. BingX Hedge Mode Bug Protection: All short/sell closing commands execute with reduceOnly=True automatically.
+### 📋 HERMES TRADING DNA v3.0 DIRECTIVES:
+1. 5-MINUTE CYCLE MEMORY: Review [RECENT EXECUTED ACTIONS]. Do NOT cancel and replace resting limit orders with identical ones. Avoid cyclic place/cancel loops!
+2. MIN ROI GATE (SOLANA): Never panic-close SOL LONG per market for small profit (+34 VST is unacceptable for accumulated position). Minimum ROI for market exit must be >= +1.5% per trade. Use Take-Profit limit orders at $79.10 / $80.30 instead of market dumping.
+3. VWAP & STOCH_RSI INTEGRATION: Favor LONGs when price < VWAP. Use StochRSI (< 20 for bottom entry, > 80 for top exit).
+4. PARTIAL REDUCTION & DCA: Never close a losing leg. Trim losing legs only with offsetting profit from DCA re-accumulation.
+5. BINGX HEDGE PROTECTION: All short/sell closing commands execute with reduceOnly=True automatically.
 
-### SOLANA (SOL) SMART DCA STRATEGY (MOMENTUM BREAKOUT):
-- Allocation Split (25% Market Entry / 75% Dynamic Limit DCA):
-  1. Immediate Market Entry (25% size, e.g. 5.0 to 10.0 SOL): Execute `["market", "buy", "LONG", qty, "SOL"]` on strong momentum.
-  2. Dynamic Limit DCA Grid (75% size, e.g. 15.0 to 35.0 SOL): Place `["place", "buy", "LONG", qty, price, "SOL"]` limit orders at 0.5 * ATR and 1.0 * ATR below price.
-
-### HEDGED LOCK ("ЗАМОК") RESOLUTION PROTOCOL:
-- Unlock open LONG and SHORT legs step-by-step near key Support/Resistance via profit harvesting (net PnL >= 0).
-
-### CURRENT POSITIONS SNAPSHOT (ALL COINS):
+### CURRENT POSITIONS SNAPSHOT:
 {json.dumps(legs, indent=2, default=str)}
 
 ### OPEN ORDERS LIST:
 {json.dumps(open_orders, indent=2, default=str)}
 
 ### MARKET INDICATORS & BIAS:
-- Indicator Bias: {bias} (Conviction: {conviction * 100:.1f}%)
 - Technical indicators: {json.dumps(tech, default=str)}
 - Order Book walls & imbalance: {json.dumps(book, default=str)}
 
 ### TASK:
 1. Write a very brief analysis of the market and cross-pair trends (in Ukrainian, max 3 lines).
-2. Define exact ccxt/qe_trade execution commands.
-3. Output the commands ONLY in a ```json code block at the very end of your response.
+2. Output exact execution commands ONLY in a ```json code block at the end.
 
-Valid commands format (JSON array of arrays):
+Valid commands format:
 ```json
 [
   ["place", "buy"|"sell", "LONG"|"SHORT", qty, price, "XRP"|"BTC"|"SOL"],
@@ -400,23 +187,28 @@ Valid commands format (JSON array of arrays):
 If no action is required, output: `[]`.
 """
 
-    
     print("[TRADER] Invoking Antigravity for trading decision...")
     
-    # 4. Визначаємо модель та викликаємо agy CLI
-    agy_model = os.getenv("AGY_MODEL")
-    agy_cmd = ["agy", "--dangerously-skip-permissions", "--print", prompt]
-    if agy_model:
-        agy_cmd = ["agy", "--model", agy_model, "--dangerously-skip-permissions", "--print", prompt]
-        print(f"[TRADER] Using custom model: {agy_model}")
-    else:
-        print("[TRADER] Using default agy model")
+    # 5. Визначаємо модель та викликаємо agy CLI без прапора --effort для моделей Flash Low
+    agy_model = os.getenv("AGY_MODEL", "Gemini 3.6 Flash (High)")
+    
+    # Для agy CLI: якщо у файлі .env стоїть Low, виправляємо на Gemini 3.6 Flash (High) або викликаємо сумісно
+    if agy_model == "Gemini 3.6 Flash (Low)":
+        agy_model = "Gemini 3.6 Flash (High)"
+        
+    agy_cmd = ["agy", "--model", agy_model, "--effort", "high", "--dangerously-skip-permissions", "--print", prompt]
+    print(f"[TRADER] Using model: {agy_model}")
         
     try:
         r = subprocess.run(
             agy_cmd,
             capture_output=True, text=True, timeout=120
         )
+        if r.returncode != 0:
+            # Якщо --effort викликає помилку через версію CLI, повторюємо без --effort
+            agy_cmd_fallback = ["agy", "--model", agy_model, "--dangerously-skip-permissions", "--print", prompt]
+            r = subprocess.run(agy_cmd_fallback, capture_output=True, text=True, timeout=120)
+            
         if r.returncode != 0:
             print(f"[TRADER] agy CLI error: {r.stderr}")
             return {"error": f"agy CLI returned {r.returncode}", "actions": []}
@@ -426,7 +218,7 @@ If no action is required, output: `[]`.
         print(response)
         print("===================================\n")
         
-        # 5. Парсимо JSON команди з відповіді
+        # 6. Парсимо JSON команди з відповіді
         cmd_block = []
         m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", response, re.DOTALL)
         if m:
@@ -442,13 +234,12 @@ If no action is required, output: `[]`.
                 except Exception:
                     pass
                     
-        # 6. Виконуємо команди
+        # 7. Виконуємо команди
         for cmd in cmd_block:
             if not isinstance(cmd, list) or not cmd:
                 continue
             action_type = cmd[0]
             
-            # Конвертуємо всі аргументи команди у строки для сумісності з subprocess.run
             cmd_args = []
             for arg in cmd[1:]:
                 if arg is None:
@@ -456,14 +247,12 @@ If no action is required, output: `[]`.
                 else:
                     cmd_args.append(str(arg))
             
-            # Видаляємо кінцеві "none" або "null" аргументи
             while cmd_args and cmd_args[-1].lower() in ("none", "null"):
                 cmd_args.pop()
                 
             print(f"[TRADER] Executing command: {[action_type] + cmd_args}")
             res = qe([action_type] + cmd_args)
             
-            # Логування дії
             act_entry = {"act": f"AG_{action_type.upper()}", "cmd": [action_type] + cmd_args, "result": res}
             actions.append(act_entry)
             
@@ -494,7 +283,6 @@ If no action is required, output: `[]`.
 
 def send_telegram_report(msg: str):
     """Надсилає повідомлення безпосередньо у Telegram через Bot API."""
-    import os
     import urllib.request
     import urllib.parse
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -515,18 +303,13 @@ def send_telegram_report(msg: str):
         print(f"[TRADER] Failed to send Telegram report: {e}")
 
 
-# =====================================================================
-# MAIN
-# =====================================================================
 def main(deep: bool = False):
     mode = "DEEP(15m)" if deep else "TRADE(5m)"
     print(f"[TRADER] {mode} cycle start {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
 
-    # 1. Аналіз
     report = analyze()
     save_analysis(report)
 
-    # 2. Рішення + дія
     state = load_state()
     state["cycle"] += 1
     state["last_bias"] = report["verdict"]["bias"]
@@ -534,13 +317,11 @@ def main(deep: bool = False):
     result = decide_and_act(report, state, deep=deep)
     save_state(state)
 
-    # 3. Звіт у консоль
     print(f"[TRADER] bias={result.get('bias')} conv={result.get('conviction')} "
           f"decision={result.get('decision')} actions={len(result.get('actions', []))}")
     for a in result.get("actions", []):
         print(f"   - {a['act']}: {a.get('qty', a.get('price', ''))}")
 
-    # 4. Підсумок PnL з журналу
     try:
         realized = 0.0
         wins = 0
@@ -562,7 +343,6 @@ def main(deep: bool = False):
     except Exception as e:
         print(f"[TRADER] pnl read warn: {e}")
 
-    # 5. Надсилаємо КОРОТКИЙ звіт у Telegram
     try:
         snap = qe(["snapshot"])
         legs = snap.get("legs", [])
@@ -603,7 +383,6 @@ def main(deep: bool = False):
                 break
         analysis_text = html.escape("\n".join(m_lines))
 
-
         tg_msg = (
             f"<b>📊 QuantumEdge Multi-Asset | Цикл #{state['cycle']}</b>\n"
             f"🪙 <b>BTC:</b> <code>{btc_price:,.1f}</code> | <b>SOL:</b> <code>{sol_price:,.2f}</code> | <b>XRP:</b> <code>{xrp_price:.4f}</code>\n"
@@ -635,4 +414,3 @@ def main(deep: bool = False):
 if __name__ == "__main__":
     deep_flag = "--deep" in sys.argv
     main(deep=deep_flag)
-

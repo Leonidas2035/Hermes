@@ -33,6 +33,8 @@ from market_data import (
     fetch_xrp_klines, fetch_funding_oi, fetch_order_book,
     fetch_btc_context, fetch_tv_rating, fetch_news, trading_session,
 )
+from config import ASSET_STRATEGIES, GLOBAL_LIMITS
+from recovery_ledger import get_accumulated_loss, get_recovery_target
 
 ANALYSIS_DIR = Path("/home/layman/.hermes/quantumedge_analysis")
 HISTORY_DIR = ANALYSIS_DIR / "history"
@@ -412,8 +414,21 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
         tech = compute_indicators(df)
         score = trend_score(tech)
         tech.update(score)
+        
+        # Calculate trend exhaustion: price dev >= 3*ATR and RSI > 75 or < 25
+        price = float(tech.get("price", 0))
+        bb_mid = float(tech.get("bb_mid", price))
+        atr_14 = float(tech.get("atr_14", 0))
+        rsi_14 = float(tech.get("rsi_14", 50))
+        
+        exhaustion = False
+        if atr_14 > 0:
+            dev = abs(price - bb_mid)
+            if dev >= 3 * atr_14 and (rsi_14 > 75 or rsi_14 < 25):
+                exhaustion = True
+        tech["trend_exhaustion"] = exhaustion
     else:
-        tech = {"bias": "NEUTRAL", "error": "klines short"}
+        tech = {"bias": "NEUTRAL", "error": "klines short", "trend_exhaustion": False}
     report["technicals"] = tech
 
     # 2. Trend shift
@@ -447,7 +462,38 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
         report["btc_analysis"], tv, news, report["session"])
     report["levels"] = build_levels(tech, book, report["trend_shift"])
 
-    # 8. Карта ліквідацій BTC (магніти ліквідності) — окремий контур tools/liqmap
+    # 8. Recovery Ledger & Signal Integration
+    base_asset = symbol.upper().replace("USDT","").replace("/","").replace(":","").strip()
+    acc_loss = get_accumulated_loss(base_asset)
+    report["recovery_ledger"] = {"symbol": base_asset, "accumulated_loss": acc_loss}
+    if acc_loss > 0:
+        rsi_val = float(tech.get("rsi_14", 50))
+        if rsi_val < 35 or tech.get("macd_hist", 0) > 0:
+            report["recovery_signal"] = {
+                "symbol": base_asset,
+                "signal": "RECOVERY_AVERAGE_DOWN",
+                "accumulated_loss": acc_loss,
+                "recommendation": "Reversal detected on bottom/recovery zone; average down to update breakeven & TP target."
+            }
+
+    # 9. Hedge Opportunities
+    hedge_ops = []
+    rsi_val = float(tech.get("rsi_14", 50))
+    if rsi_val > 75 or tech.get("trend_exhaustion"):
+        hedge_ops.append({
+            "symbol": symbol,
+            "signal": "COUNTER_SHORT_SCALP",
+            "reason": f"RSI={rsi_val} overbought / trend exhaustion"
+        })
+    elif rsi_val < 25 or (tech.get("trend_exhaustion") and rsi_val < 30):
+        hedge_ops.append({
+            "symbol": symbol,
+            "signal": "COUNTER_LONG_SCALP",
+            "reason": f"RSI={rsi_val} oversold / trend exhaustion"
+        })
+    report["hedge_opportunities"] = hedge_ops
+
+    # 10. Liquidation map
     report["liq_map"] = _load_liqmap()
 
     return report
@@ -480,11 +526,12 @@ def _load_liqmap(max_age_min: int = 20) -> dict:
 
 def save(r: dict):
     out = ANALYSIS_DIR / "market_analysis.json"
-    out.write_text(json.dumps(r, indent=2, default=str), encoding="utf-8")
+    latest_out = ANALYSIS_DIR / "latest.json"
+    content = json.dumps(r, indent=2, default=str)
+    out.write_text(content, encoding="utf-8")
+    latest_out.write_text(content, encoding="utf-8")
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    (HISTORY_DIR / f"ma_{ts}.json").write_text(
-        json.dumps(r, indent=2, default=str), encoding="utf-8")
-    # trim
+    (HISTORY_DIR / f"ma_{ts}.json").write_text(content, encoding="utf-8")
     for f in sorted(HISTORY_DIR.glob("ma_*.json"))[:-200]:
         try:
             f.unlink()

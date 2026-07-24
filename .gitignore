@@ -9,6 +9,7 @@
 !/Rules.md
 !/config.yaml
 !/FULL_SYSTEM_CONTEXT.txt
+!/quantumedge_analysis/FULL_SYSTEM_CONTEXT.txt
 
 
 # Allow memories directory and files
@@ -25,17 +26,12 @@
 !/quantumedge_analysis/
 !/quantumedge_analysis/**/
 
-# Whitelist python files and readme
+# Whitelist python, md, and context files
+!/quantumedge_analysis/*.py
 !/quantumedge_analysis/**/*.py
+!/quantumedge_analysis/*.md
 !/quantumedge_analysis/**/*.md
-
-# Allow tools directory
-!/quantumedge_analysis/tools/
-!/quantumedge_analysis/tools/**/
-!/quantumedge_analysis/tools/**/*.py
-!/quantumedge_analysis/tools/**/*.js
-!/quantumedge_analysis/tools/**/*.md
-!/quantumedge_analysis/tools/**/*.json
+!/quantumedge_analysis/FULL_SYSTEM_CONTEXT.txt
 
 # Ignore env, databases, venv, and logs in quantumedge_analysis
 /quantumedge_analysis/.env
