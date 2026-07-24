@@ -441,6 +441,9 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
     book = fetch_order_book(20)
     report["order_book"] = book
     report["manipulation"] = detect_manipulation(book)
+    
+    # 3b. Whale Orderbook Aggregation (≥ 20 BTC / large liquidity shields)
+    report["whale_orderbook"] = _load_whale_walls(symbol)
 
     # 4. Funding/OI
     report["funding_oi"] = fetch_funding_oi()
@@ -520,6 +523,21 @@ def _load_liqmap(max_age_min: int = 20) -> dict:
             "interpretation": d.get("interpretation"),
             "zones": d.get("zones", [])[:6],
         }
+    except Exception as e:
+        return {"error": str(e)[:100]}
+
+
+def _load_whale_walls(symbol: str) -> dict:
+    """Aggregates deep orderbook and returns whale liquidity shields >= 20 BTC."""
+    import subprocess
+    qe = Path("/home/layman/.hermes/quantumedge_analysis")
+    try:
+        res = subprocess.run(
+            [str(qe / "venv" / "bin" / "python3"),
+             str(qe / "tools" / "whale_aggregator.py"), symbol, "20"],
+            cwd=str(qe), capture_output=True, text=True, timeout=15
+        )
+        return json.loads(res.stdout)
     except Exception as e:
         return {"error": str(e)[:100]}
 
