@@ -50,6 +50,64 @@ def save_current_state(orders_dict):
         json.dump({"orders": orders_dict, "timestamp": time.time()}, f, indent=2)
 
 
+async def fetch_recent_filled_trades(ex, symbols, minutes=15):
+    since_ts = (time.time() - (minutes * 60 + 30)) * 1000  # 15.5 mins ago in ms
+    filled_trades = []
+    seen_ids = set()
+    
+    for s in symbols:
+        try:
+            closed_orders = await ex.fetch_closed_orders(s, since=int(since_ts))
+            for o in closed_orders:
+                oid = str(o.get("id"))
+                status = str(o.get("status", "")).lower()
+                filled_qty = float(o.get("filled") or o.get("amount") or 0)
+                
+                # Only include executed/filled trades (ignore cancelled without fill)
+                if status in ("closed", "filled") and filled_qty > 0 and oid not in seen_ids:
+                    seen_ids.add(oid)
+                    sym_base = s.split(":")[0].replace("/USDT", "")
+                    side_raw = str(o.get("side", "")).lower()
+                    side_ukr = "Купівля" if side_raw == "buy" else "Продаж"
+                    avg_price = float(o.get("average") or o.get("price") or 0)
+                    info = o.get("info", {})
+                    profit_raw = info.get("profit")
+                    pnl = float(profit_raw) if profit_raw is not None and str(profit_raw).strip() != "" and str(profit_raw) != "0.0000" else None
+                    
+                    filled_trades.append({
+                        "id": oid,
+                        "symbol": sym_base,
+                        "side_ukr": side_ukr,
+                        "qty": filled_qty,
+                        "price": avg_price,
+                        "pnl": pnl,
+                        "ts": o.get("datetime")
+                    })
+        except Exception as e:
+            print(f"[TG_REPORTER] Error fetching closed orders for {s}: {e}")
+
+    # Cross-reference with trade_journal.jsonl for exact realized PnL
+    since_str = datetime.fromtimestamp(time.time() - (minutes * 60 + 30), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    if os.path.exists(JOURNAL):
+        try:
+            with open(JOURNAL, "r") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                        if d.get("ts", "") >= since_str and d.get("act") == "close":
+                            oid = str(d.get("id"))
+                            r_pnl = d.get("realized_pnl")
+                            for ft in filled_trades:
+                                if ft["id"] == oid and r_pnl is not None:
+                                    ft["pnl"] = float(r_pnl)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+            
+    return filled_trades
+
+
 async def main():
     ak = os.getenv("BINGX_TESTNET_API_KEY") or os.getenv("BINGX_API_KEY", "")
     sc = os.getenv("BINGX_TESTNET_SECRET") or os.getenv("BINGX_SECRET", "")
@@ -132,15 +190,8 @@ async def main():
         except Exception as e:
             print(f"[TG_REPORTER] Error fetching orders for {s}: {e}")
 
-    # 4. Compare with previous state
-    prev_state = load_prev_state()
-    prev_orders = prev_state.get("orders", {})
-    
-    filled_or_cancelled = []
-    if prev_orders:
-        for oid, odata in prev_orders.items():
-            if oid not in curr_orders_dict:
-                filled_or_cancelled.append(odata)
+    # 4. Fetch executed/filled trades in last 15 mins
+    filled_trades = await fetch_recent_filled_trades(ex, symbols, minutes=15)
 
     await ex.close()
 
@@ -169,12 +220,19 @@ async def main():
     for sym, cnt in sym_counts.items():
         msg += f"• <b>{sym}</b>: {cnt} ордер(ів)\n"
     
-    if filled_or_cancelled:
-        msg += f"\n⚡ <b>Зміни у статусі ордерів за 15хв:</b>\n"
-        for fo in filled_or_cancelled:
-            msg += f"• <b>{fo['symbol']}</b> {fo['side'].upper()} ({fo['pos_side']}) — {fo['amount']} @ ${fo['price']} [Спрацьовано / Скасовано]\n"
+    if filled_trades:
+        msg += f"\n⚡ <b>Спрацьовані ордери за 15хв ({len(filled_trades)}):</b>\n"
+        for ft in filled_trades:
+            pnl_text = ""
+            if ft["pnl"] is not None and ft["pnl"] != 0:
+                if ft["pnl"] > 0:
+                    pnl_text = f" | профіт: <b>+${ft['pnl']:,.2f} VST</b>"
+                else:
+                    pnl_text = f" | профіт: <code>-${abs(ft['pnl']):,.2f} VST</code>"
+            
+            msg += f"• <b>{ft['side_ukr']}</b> {ft['qty']:,.2f} <b>{ft['symbol']}</b> за ціною <b>${ft['price']:,.4f}</b>{pnl_text}\n"
     else:
-        msg += f"\nℹ️ <i>Змін по ордерах за останні 15хв не зафіксовано.</i>\n"
+        msg += f"\nℹ️ <i>Спрацьованих ордерів за останні 15хв немає.</i>\n"
 
     save_current_state(curr_orders_dict)
     send_tg_msg(msg)
