@@ -269,7 +269,7 @@ def main():
                    step=args.step, bins=args.bins, oi_series=oi,
                    max_dist_pct=args.max_dist)
 
-    qe = Path("/home/layman/QuantumEdge")
+    qe = Path(__file__).resolve().parents[2]
     outp = qe / args.out
     
     payload = {

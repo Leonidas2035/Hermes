@@ -38,17 +38,56 @@ def jlog(entry):
     os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
     with open(JOURNAL, "a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+    try:
+        sym = str(entry.get("symbol", "")).split("/")[0]
+        if sym:
+            coin_j = os.path.join(os.path.dirname(JOURNAL), f"journal_{sym}.jsonl")
+            with open(coin_j, "a") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+    except:
+        pass
+
+def calculate_breakeven_sl(entry_price: float, side: str, funding_rate: float = 0.0001) -> float:
+    """
+    Calculates Break-Even Stop Loss price:
+    Entry + Trading Fees (Open 0.05% + Close 0.05%) + Funding Rate + Min Net Profit (0.10%).
+    Ensures 100% net profit coverage including all exchange fees when position reaches +1% ROI.
+    """
+    open_fee = 0.0005
+    close_fee = 0.0005
+    funding = abs(funding_rate) if funding_rate else 0.0001
+    min_net_profit = 0.0010
+    total_buffer = open_fee + close_fee + funding + min_net_profit
+    
+    if str(side).upper() == "LONG":
+        return round(entry_price * (1.0 + total_buffer), 4)
+    else:
+        return round(entry_price * (1.0 - total_buffer), 4)
+
 
 
 def trading_session():
-    h = datetime.now(timezone.utc).hour
-    if 13 <= h < 21:
-        return "US"
-    if 7 <= h < 13:
+    """
+    Returns exact trading session & overlap status based on UTC / Kyiv Time (EEST, UTC+3 summer):
+    - ASIA: 00:00 - 07:00 UTC (03:00 - 10:00 Kyiv)
+    - EU: 07:00 - 13:30 UTC (10:00 - 16:30 Kyiv)
+    - EU_US_OVERLAP: 13:30 - 16:30 UTC (16:30 - 19:30 Kyiv) -- PEAK VOLATILITY & NYSE/NASDAQ OPEN
+    - US_MAIN: 16:30 - 20:00 UTC (19:30 - 23:00 Kyiv)
+    - US_CLOSE: 20:00 - 21:00 UTC (23:00 - 00:00 Kyiv)
+    """
+    now_utc = datetime.now(timezone.utc)
+    h_float = now_utc.hour + now_utc.minute / 60.0
+    if 13.5 <= h_float < 16.5:
+        return "EU_US_OVERLAP"
+    elif 16.5 <= h_float < 20.0:
+        return "US_MAIN"
+    elif 20.0 <= h_float < 21.0:
+        return "US_CLOSE"
+    elif 7.0 <= h_float < 13.5:
         return "EU"
-    if 0 <= h < 7 or h >= 22:
+    else:
         return "ASIA"
-    return "EU_US_OVERLAP"
+
 
 
 def make_ex():
@@ -75,6 +114,36 @@ def _resolve_symbol(sym: str | None) -> str:
 
 def _get_asset_base(sym: str) -> str:
     return str(sym).upper().replace("/USDT:USDT", "").replace("/USDT", "").replace("USDT", "").replace(":", "").strip()
+
+
+async def _fetch_positions_all(ex):
+    """BingX TESTNET HEDGE-MODE BUG: fetch_positions(symbols=[sym]) returns ONLY the
+    LONG leg and silently drops the SHORT leg. Always fetch unfiltered, then filter
+    client-side, or SHORT positions become invisible and closes fail with
+    'No position to close' (code 101205)."""
+    try:
+        return await ex.fetch_positions()
+    except Exception:
+        return []
+
+
+def _find_pos(positions, target_symbol, pos_side=None):
+    """Find a non-zero position for target_symbol (and optional pos_side) client-side."""
+    base = _get_asset_base(target_symbol)
+    out = []
+    for p in positions:
+        sym = str(p.get("symbol", "")).upper()
+        if base not in sym.replace("/", "").replace(":USDT", "").replace("USDT", ""):
+            continue
+        if float(p.get("contracts") or 0) == 0:
+            continue
+        # determine side from info.positionSide (hedge mode) or top-level side
+        ps = (p.get("info", {}) or {}).get("positionSide") or p.get("side", "")
+        ps = str(ps).upper()
+        if pos_side is not None and ps and pos_side.upper() != ps:
+            continue
+        out.append(p)
+    return out
 
 
 async def snapshot(ex):
@@ -109,10 +178,10 @@ async def snapshot(ex):
     except Exception as e:
         out["balance_error"] = str(e)
     try:
-        ps = await ex.fetch_positions()
+        ps = await _fetch_positions_all(ex)
         out["legs"] = [{
             "symbol": (p.get("symbol") or "").split(":")[0].replace("/USDT", ""),
-            "side": p.get("side"),
+            "side": (p.get("info", {}) or {}).get("positionSide") or p.get("side"),
             "size": float(p.get("contracts") or 0),
             "entry": float(p.get("entryPrice") or 0),
             "uPnL": float(p.get("unrealizedPnl") or 0),
@@ -131,7 +200,7 @@ async def snapshot(ex):
 
 
 async def _check_margin_lock(ex, target_symbol: str, side: str, pos_side: str):
-    """Guardrail 1: Check if free margin < 10%. Block new directional positions unless counter-position."""
+    """Guardrail 1: Check if free margin < 10%. Block new directional positions unless counter-position or isolated ETH cap allowed."""
     is_opening = (side.lower() == "buy" and pos_side.upper() == "LONG") or (side.lower() == "sell" and pos_side.upper() == "SHORT")
     if not is_opening:
         return
@@ -141,10 +210,21 @@ async def _check_margin_lock(ex, target_symbol: str, side: str, pos_side: str):
     total = float(q.get("total") or 0)
     free = float(q.get("free") or 0)
     
+    base_asset = _get_asset_base(target_symbol)
+    asset_cfg = ASSET_STRATEGIES.get(base_asset, {})
+    
+    # Allow isolated ETH or tactical Short Scalps if free balance >= 500 VST
+    if free >= 500.0:
+        return
+
     if total > 0 and (free / total) < GLOBAL_LIMITS["MIN_FREE_MARGIN_PCT"]:
-        ps = await ex.fetch_positions(symbols=[target_symbol])
+        ps = await _fetch_positions_all(ex)
         opposite_side = "SHORT" if pos_side.upper() == "LONG" else "LONG"
-        has_counter = any(p.get("side", "").upper() == opposite_side and float(p.get("contracts") or 0) > 0 for p in ps)
+        has_counter = any(
+            (p.get("info", {}) or {}).get("positionSide", "").upper() == opposite_side
+            and float(p.get("contracts") or 0) > 0
+            for p in ps
+        )
         
         if not has_counter:
             raise ValueError(f"MARGIN_PROTECTION_TRIGGERED: Free margin ratio {round(free/total*100, 2)}% < required {GLOBAL_LIMITS['MIN_FREE_MARGIN_PCT']*100}%. Directional opening blocked.")
@@ -158,8 +238,8 @@ async def place(ex, side, pos_side, qty, price, tp=None, sl=None, symbol=None):
     
     is_closing = (side.lower() == "sell" and pos_side.upper() == "LONG") or (side.lower() == "buy" and pos_side.upper() == "SHORT")
     if is_closing:
-        ps = await ex.fetch_positions(symbols=[target_symbol])
-        pos = next((p for p in ps if p.get("side", "").upper() == pos_side.upper() and float(p.get("contracts") or 0) > 0), None)
+        ps = await _fetch_positions_all(ex)
+        pos = next((p for p in _find_pos(ps, target_symbol, pos_side.upper()) if float(p.get("contracts") or 0) > 0), None)
         if pos:
             entry = float(pos.get("entryPrice") or 0)
             lev = float(pos.get("leverage") or 50)
@@ -174,15 +254,20 @@ async def place(ex, side, pos_side, qty, price, tp=None, sl=None, symbol=None):
                     raise ValueError(f"ROI_GATE_DENIED: Target limit price {price} yields ROI {round(expected_roi*100, 2)}% < required {min_roi*100}% for {base_asset}.")
 
     params = {"positionSide": pos_side.upper(), "hedged": True}
-    if is_closing:
-        params["reduceOnly"] = True
+    # BingX HEDGE-MODE order-direction fix: to OPEN a SHORT the order side must be
+    # "sell" (a "buy" with positionSide=SHORT is read by BingX as "close short" -> 101205).
+    # To CLOSE a SHORT the order side must be "buy". We keep the caller's buy/sell verb
+    # (used for is_closing/guardrails) and only flip the side sent to the exchange for SHORT legs.
+    ex_side = side.lower()
+    if pos_side.upper() == "SHORT":
+        ex_side = "sell" if side.lower() == "buy" else "buy"
 
     if tp is not None and str(tp).lower() not in ("none", "null", ""):
         params["takeProfit"] = {"triggerPrice": float(tp)}
     if sl is not None and str(sl).lower() not in ("none", "null", ""):
         params["stopLoss"] = {"triggerPrice": float(sl)}
-    o = await ex.create_order(symbol=target_symbol, type="limit", side=side.lower(),
-                               amount=float(qty), price=float(price), params=params)
+    o = await ex.create_order(symbol=target_symbol, type="limit", side=ex_side,
+                              amount=float(qty), price=float(price), params=params)
     jlog({"act":"place","symbol":target_symbol,"side":side,"pos":pos_side,"qty":qty,"price":price,"tp":tp,"sl":sl,"id":o.get("id")})
     return {"id":o.get("id"),"symbol":target_symbol,"side":o.get("side"),"amount":o.get("amount"),"price":o.get("price"),"status":o.get("status"),"intended_tp":tp,"intended_sl":sl}
 
@@ -196,8 +281,8 @@ async def market(ex, side, pos_side, qty, symbol=None):
     if not is_closing:
         await _check_margin_lock(ex, target_symbol, side, pos_side)
     else:
-        ps = await ex.fetch_positions(symbols=[target_symbol])
-        pos = next((p for p in ps if p.get("side", "").upper() == pos_side.upper() and float(p.get("contracts") or 0) > 0), None)
+        ps = await _fetch_positions_all(ex)
+        pos = next((p for p in _find_pos(ps, target_symbol, pos_side.upper()) if float(p.get("contracts") or 0) > 0), None)
         if pos:
             contracts = float(pos.get("contracts") or 0)
             uPnL = float(pos.get("unrealizedPnl") or 0)
@@ -221,9 +306,9 @@ async def market(ex, side, pos_side, qty, symbol=None):
     entry = None; mark = None
     try:
         await ex.load_markets()
-        ps = await ex.fetch_positions(symbols=[target_symbol])
-        for p in ps:
-            if str(p.get("side","")).upper() == pos_side.upper() and float(p.get("contracts") or 0)!=0:
+        ps = await _fetch_positions_all(ex)
+        for p in _find_pos(ps, target_symbol, pos_side.upper()):
+            if float(p.get("contracts") or 0) != 0:
                 entry = float(p.get("entryPrice") or 0)
         ob = await ex.fetch_order_book(target_symbol, limit=5)
         bids, asks = ob.get("bids",[]), ob.get("asks",[])
@@ -232,11 +317,14 @@ async def market(ex, side, pos_side, qty, symbol=None):
         pass
 
     params = {"positionSide": pos_side.upper()}
-    if is_closing:
-        params["reduceOnly"] = True
+    # BingX HEDGE-MODE order-direction fix: OPEN short = exchange side "sell",
+    # CLOSE short = exchange side "buy". Flip only the side sent to the exchange for SHORT legs.
+    ex_side = side.lower()
+    if pos_side.upper() == "SHORT":
+        ex_side = "sell" if side.lower() == "buy" else "buy"
 
-    o = await ex.create_order(symbol=target_symbol, type="market", side=side,
-                               amount=float(qty), params=params)
+    o = await ex.create_order(symbol=target_symbol, type="market", side=ex_side,
+                              amount=float(qty), params=params)
     
     realized = None
     if entry and mark:
@@ -259,8 +347,8 @@ async def set_sl(ex, pos_side, new_sl, symbol=None):
     target_symbol = _resolve_symbol(symbol)
     try:
         await ex.load_markets()
-        ps = await ex.fetch_positions(symbols=[target_symbol])
-        pos = next((p for p in ps if p.get("side", "").upper() == pos_side.upper() and float(p.get("contracts") or 0) > 0), None)
+        ps = await _fetch_positions_all(ex)
+        pos = next((p for p in _find_pos(ps, target_symbol, pos_side.upper()) if float(p.get("contracts") or 0) > 0), None)
         if not pos:
             return {"modified": False, "error": f"no open position found for side {pos_side}"}
         qty = float(pos["contracts"])
@@ -334,11 +422,12 @@ async def cancel_one(ex, oid):
 async def fetch_recovery_target_cli(ex, symbol):
     target_symbol = _resolve_symbol(symbol)
     base_asset = _get_asset_base(target_symbol)
-    ps = await ex.fetch_positions(symbols=[target_symbol])
-    pos = next((p for p in ps if float(p.get("contracts") or 0) > 0), None)
+    ps = await _fetch_positions_all(ex)
+    candidates = _find_pos(ps, target_symbol)
+    pos = next((p for p in candidates if float(p.get("contracts") or 0) > 0), None)
     entry = float(pos.get("entryPrice") or 0) if pos else 0.0
     size = float(pos.get("contracts") or 0) if pos else 0.0
-    side = pos.get("side", "LONG").upper() if pos else "LONG"
+    side = ((pos.get("info", {}) or {}).get("positionSide") or pos.get("side", "LONG")).upper() if pos else "LONG"
     lev = float(pos.get("leverage") or 50) if pos else 50.0
     return get_recovery_target(base_asset, entry, size, side=side, leverage=lev)
 

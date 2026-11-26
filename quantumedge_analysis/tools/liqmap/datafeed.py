@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 SYMBOL = "BTC/USDT:USDT"
-CACHE_DIR = Path("/home/layman/QuantumEdge/runtime/cache")
+CACHE_DIR = Path(__file__).resolve().parents[2] / "runtime" / "cache"
 
 
 def _mk(name):

@@ -5,10 +5,17 @@ description: Operations, supervision, and debugging playbook for the user's pers
 
 # QuantumEdge Operations (Orchestrator / Supervisor)
 
-QuantumEdge is the user's personal HFT orchestration project at
-`/home/layman/QuantumEdge`. The agent's role here is **Orchestrator + Supervisor**:
+QuantumEdge is the user's personal HFT orchestration project, migrated to
+`/home/layman/.hermes/quantumedge_analysis/` (the old `/home/layman/QuantumEdge`
+path is stale). The agent's role here is **Orchestrator + Supervisor**:
 read system state, analyze the market, publish a trading plan, and apply
-user-sanctioned exchange actions.
+user-sanctioned exchange actions. The autonomous decision core is `trader.py`
+(prompt -> `agy` CLI --print -> regex-JSON -> `tools/qe_trade.py`). See
+`references/agy-trader-wiring.md` for the data flow, break-mode checklist, the
+AGY read-only audit technique, and the no-real-orders mock-verification recipe.
+See `references/init-take-control.md` for the boot/wake-up runbook: reading the
+DNA files in order, HFT-daemon launch via `terminal(background=true)`, the 5m
+brain-cron recipe, and the pgrep/nohup/stale-order pitfalls.
 
 **Two operating modes — the user tells you which:**
 - **Per-action authorization (default):** NEVER trade or close positions on
@@ -51,6 +58,12 @@ The user wants CHAT REPLIES KEPT SHORT and token-light, especially during live t
 Apply in this project: report only signal-bearing facts — price, imbalance, session, orders placed,
 closed/won trades, realized PnL. No preamble, no restated context, no "as an AI" filler, no long
 rationale unless the user asks. Bullet or one-liner. Tables OK only when comparing multiple values.
+
+**Report contract (owner correction, 2026-08-04):** The owner does not read long technical
+market reports. Keep chat output to result and next actions only; analysis, indicators,
+calculations, and implementation details stay internal. Preferred format is at most three short
+lines: `ДІЯ/СТАН: ...`, `РИНОК: ...`, `НАСТУПНІ 5–15 хв: ...`. Do not append technical caveats,
+portfolio arithmetic, or architecture explanations unless explicitly requested.
 
 ## Trader persona — Shark / Market-Maker (user elevation, standing)
 The user promoted the agent from passive supervisor to an active trader:
@@ -658,9 +671,8 @@ cap), (d) orders token-light reporting. A reusable template lives in
 - `references/watchdog_architecture.md` — the 2026-07-21 split architecture:
   local 8B LLM as Watchdog (Ollama/4060) + cloud hy3 as Trader + agy for deep
   analysis. Data flow, ccxt-async gotcha, cron inventory, failure modes.
-- `references/ollama_watchdog_autostart.md` — post-reboot fix: Ollama MUST be a
-  systemd user unit or the watchdog silently runs in LLM-less fallback. Exact
-  `ollama.service` + `watchdog.service` After/Wants recipe and verification steps.
+- `references/ollama_watchdog_autostart.md` — historical Watchdog/Ollama architecture reference; do not use when the owner has requested Watchdog removal.
+- `references/watchdog-removal.md` — verified removal sequence, scope boundaries, and post-removal checks.
 - `references/agent_cron_prompt.md` — copy-paste `no_agent=false` cron prompt
   for agent-driven XRP trading (be-the-brain mode): qe_trade.py command set,
   lock rules, session-based breakout forecast, token-light report format.

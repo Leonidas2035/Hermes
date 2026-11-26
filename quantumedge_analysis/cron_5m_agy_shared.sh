@@ -8,7 +8,7 @@ LOG_FILE="/home/layman/.hermes/quantumedge_analysis/cron_agy.log"
 $VENV_PYTHON $ANALYSIS_SCRIPT > /dev/null 2>&1
 
 # Формуємо тригер
-PROMPT="[СИСТЕМНИЙ ТРИГЕР 5m CYCLE]: Дані оновлено. Проаналізуй /home/layman/.hermes/quantumedge_analysis/runtime/latest.json. Застосуй Hermes DNA. Якщо потрібні зміни — самостійно виконай bash-команди через qe_trade.py. Якщо дій не потрібно — відповідай '[HOLD]'. Нічого не виводь зайвого."
+PROMPT="[СИСТЕМНИЙ ТРИГЕР 5m CYCLE]: Дані оновлено. Проаналізуй /home/layman/.hermes/quantumedge_analysis/latest.json. Застосуй Hermes DNA. Якщо потрібні зміни — самостійно виконай bash-команди через qe_trade.py. Якщо дій не потрібно — відповідай '[HOLD]'. Нічого не виводь зайвого."
 
 # Фоновий запуск AGY зі спільним ID сесії (записує контекст у SQLite)
 agy --model "Gemini 3.6 Flash (High)" --conversation "hermes_live_01" --dangerously-skip-permissions --add-dir /home/layman/.hermes/quantumedge_analysis --print "$PROMPT" >> "$LOG_FILE" 2>&1

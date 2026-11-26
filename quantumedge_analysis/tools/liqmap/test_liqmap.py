@@ -184,6 +184,6 @@ def test_pagination_and_cache():
     assert loaded_old is None
     
     # Видаляємо тестовий файл
-    cache_path = Path(f"/home/layman/QuantumEdge/runtime/cache/{key}.json")
+    cache_path = Path(__file__).resolve().parents[2] / "runtime" / "cache" / f"{key}.json"
     if cache_path.exists():
         cache_path.unlink()

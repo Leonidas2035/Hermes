@@ -65,6 +65,15 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     ema20_prev = float(ema20.iloc[-3]) if len(ema20) >= 3 else ema20_now
     ema20_slope_pct = ((ema20_now - ema20_prev) / ema20_prev * 100.0) if ema20_prev else 0.0
 
+    # --- 8. Trading Range (Donchian Channels N=20) ---
+    donchian_h = high.rolling(window=20).max()
+    donchian_l = low.rolling(window=20).min()
+    donchian_m = (donchian_h + donchian_l) / 2.0
+    
+    tr_res = float(donchian_h.iloc[-1]) if not donchian_h.empty else price
+    tr_sup = float(donchian_l.iloc[-1]) if not donchian_l.empty else price
+    tr_mid = float(donchian_m.iloc[-1]) if not donchian_m.empty else price
+
     # --- Похідні сигнали ---
     bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid else 0.0
     bb_pos = (price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
@@ -124,6 +133,9 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         "bb_position": round(bb_pos, 3),
         "atr_14": round(atr, 6),
         "atr_pct": round(atr_pct, 3),
+        "tr_resistance": round(tr_res, 6),
+        "tr_support": round(tr_sup, 6),
+        "tr_mid": round(tr_mid, 6),
     }
 
 

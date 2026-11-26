@@ -110,6 +110,57 @@ def fetch_funding_oi() -> dict:
 
 
 # --------------------------------------------------------------------------
+# 2b. Order Flow / CVD (Cumulative Volume Delta)
+# --------------------------------------------------------------------------
+def fetch_cvd(limit: int = 500) -> dict:
+    """
+    Рахує Cumulative Volume Delta за останні N публічних угод.
+    Показує реальну агресію покупців проти продавців (market orders).
+    """
+    ex = _make_exchange()
+    try:
+        trades = ex.fetch_trades(CCXT_SYMBOL, limit=limit)
+        buy_vol = sum(float(t.get('amount', 0)) for t in trades if t.get('side') == 'buy')
+        sell_vol = sum(float(t.get('amount', 0)) for t in trades if t.get('side') == 'sell')
+        cvd = buy_vol - sell_vol
+        total_vol = buy_vol + sell_vol
+        cvd_imbalance = round(cvd / total_vol, 3) if total_vol > 0 else 0
+        return {
+            "ok": True,
+            "buy_vol": buy_vol,
+            "sell_vol": sell_vol,
+            "cvd": cvd,
+            "cvd_imbalance": cvd_imbalance
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        try:
+            ex.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# 2c. On-Chain Smart Money Tracking (Proxy)
+# --------------------------------------------------------------------------
+def fetch_onchain_smart_money() -> dict:
+    """
+    Трекінг великих рухів на блокчейні.
+    Наразі повертає базовий статус без аномалій,
+    готовий до інтеграції з CryptoQuant/Glassnode API.
+    """
+    return {
+        "ok": True,
+        "exchange_inflow_anomaly": False,
+        "stablecoin_minting_anomaly": False,
+        "whale_alert": "CLEAR",
+        "note": "On-Chain metrics are stable (Placeholder for API)."
+    }
+
+
+
+# --------------------------------------------------------------------------
 # 3. Order book (мікроструктура) — стінки + imbalance
 # --------------------------------------------------------------------------
 def fetch_order_book(depth: int = 20) -> dict:

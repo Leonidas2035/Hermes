@@ -41,3 +41,14 @@
 /quantumedge_analysis/history/
 /quantumedge_analysis/*.jsonl
 /quantumedge_analysis/*.json
+
+# Safety net overrides
+*.key
+*.pem
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.env.*
+!.env.example

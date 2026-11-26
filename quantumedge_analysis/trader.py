@@ -28,6 +28,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+DRY_RUN = "--dry-run" in sys.argv
+
 QE = Path("/home/layman/.hermes/quantumedge_analysis")
 VENV = QE / "venv" / "bin" / "python3"
 ANALYSIS_DIR = Path("/home/layman/.hermes/quantumedge_analysis")
@@ -46,7 +48,15 @@ def jlog(entry: dict):
 
 
 def qe(args: list) -> dict:
-    """Викликає qe_trade.py і повертає JSON-результат."""
+    """Викликає qe_trade.py і повертає JSON-результат.
+    У DRY_RUN режимі мутаційні дії (place/market/cancel/modify_sl/set_sl)
+    НЕ виконуються на біржі — лише логуються для факт-чеку.
+    """
+    action = (args[0] if args else "").lower()
+    MUTATING = {"place", "market", "cancel", "modify_sl", "set_sl"}
+    if DRY_RUN and action in MUTATING:
+        print(f"[DRY-RUN] WOULD EXECUTE: qe_trade.py {' '.join(map(str, args))}")
+        return {"dry_run": True, "action": action, "args": list(args), "simulated": True}
     r = subprocess.run(
         [str(VENV), str(QE / "tools" / "qe_trade.py"), *args],
         capture_output=True, text=True, timeout=120, cwd=str(QE),
@@ -130,17 +140,23 @@ def decide_and_act(report: dict, state: dict, deep: bool = False) -> dict:
     
     total_balance = float(balance.get("total") or 1.0)
     free_pct = (free_balance / total_balance) * 100.0 if total_balance > 0 else 100.0
-    margin_rule = "⚡ DEMO AGGRESSIVE MODE ACTIVE (US SESSION): Margin limit relaxed to 10% free margin buffer!"
+    margin_rule = (
+        f"⚠️ [MARGIN LOCK ACTIVE]: Free margin {free_pct:.1f}% is BELOW 10.0% — STRICTLY NO new directional positions. Only reduceOnly / cancellations permitted."
+        if free_pct < 10.0 else
+        "✅ Free margin OK (>= 10.0%). Normal directional trading permitted under DNA v4.0."
+    )
 
     # 3. Зчитуємо останні 5 дій з журналу пам'яті
     recent_actions = get_recent_actions(5)
 
     # 4. Будуємо розширений контекстний промпт для Antigravity
-    prompt = f"""You are the 2T+ Antigravity Trading Brain operating under HERMES TRADING DNA v3.0.
+    prompt = f"""You are the 2T+ Antigravity Trading Brain operating under HERMES TRADING DNA v4.0 NATIVE.
 You must analyze the multi-asset market state (XRP, BTC, SOL) and output precise execution commands.
 
-### ACTIVE TRADING PAIRS:
-- XRPUSDT | BTCUSDT | SOLUSDT
+### ACTIVE TRADING PAIRS & DNA v4.0 DIRECTIVES:
+- BTC/USDT: FROZEN MODE. Do NOT place, modify, or close BTC positions without explicit manual order.
+- XRP/USDT: LONG under MANUAL control (do NOT average/touch). SHORT SCALP ALLOWED when overbought (5m StochRSI > 80 or heavy Ask walls).
+- SOL/USDT: SWING TRADING. Target ROI >= +30.0%. Use TP limit orders, never panic-dump.
 
 ### CROSS-PAIR RATIOS & PRICES:
 - BTC/USDT: {btc_price} (24h: {btc_ctx.get('btc_change24')}%)
@@ -155,12 +171,13 @@ You must analyze the multi-asset market state (XRP, BTC, SOL) and output precise
 ### 🧠 RECENT EXECUTED ACTIONS (LAST 5 CYCLES / MEMORY PERSISTENCE):
 {json.dumps(recent_actions, indent=2, default=str)}
 
-### 📋 HERMES TRADING DNA v3.0 DIRECTIVES:
-1. 5-MINUTE CYCLE MEMORY: Review [RECENT EXECUTED ACTIONS]. Do NOT cancel and replace resting limit orders with identical ones. Avoid cyclic place/cancel loops!
-2. MIN ROI GATE (SOLANA): Never panic-close SOL LONG per market for small profit (+34 VST is unacceptable for accumulated position). Minimum ROI for market exit must be >= +1.5% per trade. Use Take-Profit limit orders at $79.10 / $80.30 instead of market dumping.
-3. VWAP & STOCH_RSI INTEGRATION: Favor LONGs when price < VWAP. Use StochRSI (< 20 for bottom entry, > 80 for top exit).
-4. PARTIAL REDUCTION & DCA: Never close a losing leg. Trim losing legs only with offsetting profit from DCA re-accumulation.
-5. BINGX HEDGE PROTECTION: All short/sell closing commands execute with reduceOnly=True automatically.
+### 📋 HERMES TRADING DNA v4.0 SACRED DIRECTIVES:
+1. NO FULL LOSS REALIZATION: NEVER close a losing position (uPnL < 0) 100% per market. Max 50% partial reduction ONLY when offset by counter-profit.
+2. MINIMUM ROI GATES: SOL Swing target ROI >= +30.0%. XRP/BTC DCA/Scalp target ROI >= +1.5%.
+3. 10% FREE MARGIN PROTECTION: If free margin < 10.0%, output [] (HOLD) or reduceOnly/cancel only. No new directional positions.
+4. 5-MINUTE CYCLE MEMORY: Review [RECENT EXECUTED ACTIONS]. Do NOT cancel/replace identical resting limit orders. Avoid cyclic place/cancel loops.
+5. STOCH_RSI (5m/15m): StochRSI < 20 = bottom entry; > 80 = top exit / short-scalp signal.
+6. BINGX HEDGE: All short/sell closing commands execute with reduceOnly=True automatically.
 
 ### CURRENT POSITIONS SNAPSHOT:
 {json.dumps(legs, indent=2, default=str)}
@@ -384,7 +401,7 @@ def main(deep: bool = False):
         analysis_text = html.escape("\n".join(m_lines))
 
         tg_msg = (
-            f"<b>📊 QuantumEdge Multi-Asset | Цикл #{state['cycle']}</b>\n"
+            f"<b>📊 QuantumEdge Multi-Asset{' [DRY-RUN]' if DRY_RUN else ''} | Цикл #{state['cycle']}</b>\n"
             f"🪙 <b>BTC:</b> <code>{btc_price:,.1f}</code> | <b>SOL:</b> <code>{sol_price:,.2f}</code> | <b>XRP:</b> <code>{xrp_price:.4f}</code>\n"
             f"📊 <b>Крос-пари:</b> BTC/SOL: <code>{btc_sol}</code> | BTC/XRP: <code>{btc_xrp}</code>\n\n"
             f"<b>🔒 Позиції («Замок»):</b>\n"

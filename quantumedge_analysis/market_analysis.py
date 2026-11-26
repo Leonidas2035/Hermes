@@ -22,6 +22,7 @@ QuantumEdge — MARKET ANALYSIS (Hermes Trader / Market-Maker mode)
 """
 from __future__ import annotations
 import json
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ from indicators import compute_indicators, trend_score
 from market_data import (
     fetch_xrp_klines, fetch_funding_oi, fetch_order_book,
     fetch_btc_context, fetch_tv_rating, fetch_news, trading_session,
+    fetch_cvd, fetch_onchain_smart_money
 )
 from config import ASSET_STRATEGIES, GLOBAL_LIMITS
 from recovery_ledger import get_accumulated_loss, get_recovery_target
@@ -249,14 +251,28 @@ def analyze_btc(btc: dict) -> dict:
 # =====================================================================
 # 4. СИНТЕЗ ВЕРДИКТУ ТРЕЙДЕРА
 # =====================================================================
-def trader_verdict(tech, trend, manip, btc_an, tv, news, session) -> dict:
+def trader_verdict(tech, trend, manip, btc_an, tv, news, session, margin_pct: "float | None" = None, stoch5m: "float | None" = None, cvd_data: dict = None, onchain_data: dict = None, funding_oi: dict = None) -> dict:
     """
     Акула зважує ВСЕ і видає вердикт.
     conviction: 0..1 (наскільки впевнений)
+    margin_pct: вільна маржа % (Священне правило ≥10%). Якщо <10 -> HOLD.
+    stoch5m: 5m StochRSI для мікро-перегріву/переохолодження (ДНК v4.0).
     """
     votes_long = 0
     votes_short = 0
     notes = []
+
+    # --- MARGIN GUARD (Священне правило) ---
+    if margin_pct is not None and margin_pct < MARGIN_FLOOR_PCT:
+        notes.append(f"MARGIN_LOCK: free {margin_pct}% < {MARGIN_FLOOR_PCT}% — нові позиції ЗАБОРОНЕНО (HOLD)")
+        return {
+            "bias": "HOLD",
+            "conviction": 0.0,
+            "votes_long": 0,
+            "votes_short": 0,
+            "notes": notes,
+            "margin_lock": True,
+        }
 
     # Technical bias
     tb = tech.get("bias")
@@ -312,6 +328,36 @@ def trader_verdict(tech, trend, manip, btc_an, tv, news, session) -> dict:
             elif "SPOOF_ASK" in f:
                 votes_long += 1
                 notes.append("spoof ask = фейк resistance, чекай зняття")
+
+    # 1. Order Flow (CVD)
+    if cvd_data and cvd_data.get("ok"):
+        cvd_imb = cvd_data.get("cvd_imbalance", 0)
+        if cvd_imb > 0.2:
+            votes_long += 1
+            notes.append(f"ORDER_FLOW: CVD Imbalance +{cvd_imb:.2f} (aggressive buying)")
+        elif cvd_imb < -0.2:
+            votes_short += 1
+            notes.append(f"ORDER_FLOW: CVD Imbalance {cvd_imb:.2f} (aggressive selling)")
+
+    # 2. Derivatives (Funding & OI)
+    if funding_oi:
+        fr = funding_oi.get("funding_rate")
+        if fr is not None:
+            if fr > 0.0003: # High positive funding (longs overleveraged) -> bearish
+                votes_short += 1
+                notes.append(f"DERIVATIVES: High Funding {fr:.4f} (longs overleveraged)")
+            elif fr < -0.0003:
+                votes_long += 1
+                notes.append(f"DERIVATIVES: Negative Funding {fr:.4f} (shorts trapped)")
+
+    # 3. On-Chain Smart Money
+    if onchain_data and onchain_data.get("ok"):
+        if onchain_data.get("exchange_inflow_anomaly"):
+            votes_short += 2
+            notes.append("ONCHAIN: Whale Exchange Inflow Anomaly!")
+        if onchain_data.get("stablecoin_minting_anomaly"):
+            votes_long += 1
+            notes.append("ONCHAIN: Huge Stablecoin Minting (liquidity injection)")
 
     # Фінальний вердикт
     if votes_long > votes_short:
@@ -376,6 +422,170 @@ def build_levels(tech, book, trend) -> dict:
 
 
 # =====================================================================
+# 3b. MARGIN GUARD — Священне правило ≥10% вільної маржі
+# =====================================================================
+MARGIN_FLOOR_PCT = 10.0  # мінімальна вільна маржа для дозволу нових позицій
+
+
+def get_margin_pct() -> float:
+    """
+    Читає вільну маржу з qe_trade.py snapshot (read-only).
+    Повертає free/total * 100. При помилці -> 0.0 (форсує HOLD).
+    """
+    try:
+        qe = Path(__file__).resolve().parent
+        res = subprocess.run(
+            [str(qe / "venv" / "bin" / "python3"), str(qe / "tools" / "qe_trade.py"), "snapshot"],
+            cwd=str(qe), capture_output=True, text=True, timeout=30)
+        d = json.loads(res.stdout)
+        bal = d.get("balance", {})
+        total = float(bal.get("total", 0) or 0)
+        free = float(bal.get("free", 0) or 0)
+        if total > 0:
+            return round(free / total * 100.0, 2)
+    except Exception:
+        pass
+    return 0.0
+
+
+def margin_allowed() -> bool:
+    """True якщо вільна маржа >= поріг (дозволено нові позиції)."""
+    return get_margin_pct() >= MARGIN_FLOOR_PCT
+
+
+# =====================================================================
+# 3c. SOL SWING ANALYSIS (ізольовано, не чіпає базовий market_data)
+# =====================================================================
+def analyze_sol(interval: str = "1h", limit: int = 120) -> dict:
+    """
+    SOL/USDT swing-аналіз для контуру ДНК v4.0 (ROI закриття >= 30%).
+    Використовує прямий exchange-виклик у try/except (ізоляція).
+    Повертає тех-секцію + рівні + swing-байас.
+    """
+    from market_data import _make_exchange  # ізольований імпорт
+    try:
+        ex = _make_exchange()
+        try:
+            raw = ex.fetch_ohlcv("SOL/USDT:USDT", interval, limit=limit)
+        except Exception:
+            raw = ex.fetch_ohlcv("SOL/USDT", interval, limit=limit)
+        rows = [{"open": float(r[1]), "high": float(r[2]), "low": float(r[3]),
+                 "close": float(r[4]), "volume": float(r[5])} for r in raw]
+        df = pd.DataFrame(rows)
+        ind = compute_indicators(df)
+        sc = trend_score(ind)
+        ind.update(sc)
+        price = float(ind["price"])
+        atr = float(ind["atr_14"])
+        bb_l, bb_m, bb_u = ind["bb_lower"], ind["bb_mid"], ind["bb_upper"]
+        # Swing-long план: вхід біля BB-low, TP біля BB-mid/upper
+        entry = round(bb_l if price > bb_l else price * 0.999, 3)
+        tp1 = round(bb_m, 3)
+        tp2 = round(bb_u, 3)
+        sl = round(entry - atr * 2.0, 3)
+        roi_tp1 = round((tp1 - entry) / entry * 100, 2)
+        roi_tp2 = round((tp2 - entry) / entry * 100, 2)
+        return {
+            "ok": True,
+            "symbol": "SOLUSDT",
+            "interval": interval,
+            "price": price,
+            "rsi_14": ind["rsi_14"],
+            "stoch_rsi": ind["stoch_rsi"],
+            "macd_state": ind["macd_state"],
+            "bb_position": ind["bb_position"],
+            "atr_14": atr,
+            "bias": sc["bias"],
+            "score": sc["score"],
+            "entry_zone": entry,
+            "tp1": tp1,
+            "tp2": tp2,
+            "stop_loss": sl,
+            "roi_tp1_pct": roi_tp1,
+            "roi_tp2_pct": roi_tp2,
+            "close_rule": "SOL Swing LONG: закриття ЛИШЕ при ROI >= 30.0%",
+        }
+    except Exception as e:
+        return {"ok": False, "symbol": "SOLUSDT", "error": str(e)[:120]}
+
+
+# =====================================================================
+# 3d. ETH SCALP & SWING ANALYSIS (ізольовано)
+# =====================================================================
+def analyze_eth(interval: str = "15m", limit: int = 120) -> dict:
+    """
+    ETH/USDT ізольований 50x скальп/свінг аналіз з лімітом маржі 1000 VST.
+    """
+    from market_data import _make_exchange
+    try:
+        ex = _make_exchange()
+        try:
+            raw = ex.fetch_ohlcv("ETH/USDT:USDT", interval, limit=limit)
+        except Exception:
+            raw = ex.fetch_ohlcv("ETH/USDT", interval, limit=limit)
+        rows = [{"open": float(r[1]), "high": float(r[2]), "low": float(r[3]),
+                 "close": float(r[4]), "volume": float(r[5])} for r in raw]
+        df = pd.DataFrame(rows)
+        ind = compute_indicators(df)
+        sc = trend_score(ind)
+        ind.update(sc)
+        price = float(ind["price"])
+        atr = float(ind["atr_14"])
+        bb_l, bb_m, bb_u = ind["bb_lower"], ind["bb_mid"], ind["bb_upper"]
+        
+        # 50x Leverage & 1000 VST Margin Cap Parameters
+        leverage = 50
+        allocated_margin = 1000.0  # VST
+        notional_cap = 50000.0      # 1000 * 50 = 50,000 VST
+        max_qty = round(notional_cap / price, 3)
+        
+        entry = round(bb_l if price > bb_l else price * 0.999, 2)
+        tp1 = round(bb_m, 2)
+        tp2 = round(bb_u, 2)
+        
+        # Strict Stop-Loss at 1.0% (Risk cap ~500 VST / 50% allocated margin)
+        sl_long = round(entry * 0.990, 2)
+        sl_short = round(entry * 1.010, 2)
+        
+        # Liquidation Estimates at 50x (~1.8% price move)
+        est_liq_long = round(entry * 0.982, 2)
+        est_liq_short = round(entry * 1.018, 2)
+        
+        roi_tp1 = round((tp1 - entry) / entry * 50 * 100, 2)
+        roi_tp2 = round((tp2 - entry) / entry * 50 * 100, 2)
+        
+        return {
+            "ok": True,
+            "symbol": "ETHUSDT",
+            "interval": interval,
+            "price": price,
+            "leverage": leverage,
+            "allocated_margin_vst": allocated_margin,
+            "notional_cap_vst": notional_cap,
+            "max_qty": max_qty,
+            "rsi_14": ind["rsi_14"],
+            "stoch_rsi": ind["stoch_rsi"],
+            "macd_state": ind["macd_state"],
+            "bb_position": ind["bb_position"],
+            "atr_14": atr,
+            "bias": sc["bias"],
+            "score": sc["score"],
+            "entry_zone": entry,
+            "tp1": tp1,
+            "tp2": tp2,
+            "stop_loss_long": sl_long,
+            "stop_loss_short": sl_short,
+            "est_liq_long": est_liq_long,
+            "est_liq_short": est_liq_short,
+            "roi_tp1_pct_50x": roi_tp1,
+            "roi_tp2_pct_50x": roi_tp2,
+            "close_rule": "ETH 50x Isolated: 1000 VST cap, SL 1.0% (50% margin risk), TP ROI >= 1.5%",
+        }
+    except Exception as e:
+        return {"ok": False, "symbol": "ETHUSDT", "error": str(e)[:120]}
+
+
+# =====================================================================
 # HELPERS (ta wrappers)
 # =====================================================================
 def ta_trend_macd(close):
@@ -406,6 +616,23 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
         "session": trading_session(),
         "trader": "Hermes Market-Maker (15+ yr)",
     }
+
+    # Margin guard
+    margin_pct = get_margin_pct()
+    report["margin_pct"] = margin_pct
+
+    # 5m StochRSI
+    try:
+        kl5m = fetch_xrp_klines("5m", limit=120)
+        if kl5m.get("ok"):
+            df5m = pd.DataFrame(kl5m["klines"])
+            ind5m = compute_indicators(df5m)
+            stoch5m = ind5m.get("stoch_rsi")
+        else:
+            stoch5m = None
+    except Exception:
+        stoch5m = None
+    report["stoch5m"] = stoch5m
 
     # 1. Klines + індикатори
     kl = fetch_xrp_klines(interval, limit=120)
@@ -446,7 +673,14 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
     report["whale_orderbook"] = _load_whale_walls(symbol)
 
     # 4. Funding/OI
-    report["funding_oi"] = fetch_funding_oi()
+    foi = fetch_funding_oi()
+    report["funding_oi"] = foi
+    
+    # 4b. Order Flow & On-Chain
+    cvd = fetch_cvd(500)
+    onchain = fetch_onchain_smart_money()
+    report["cvd_order_flow"] = cvd
+    report["onchain_data"] = onchain
 
     # 5. BTC
     btc = fetch_btc_context()
@@ -462,7 +696,9 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
     # 7. Verdict + levels
     report["verdict"] = trader_verdict(
         tech, report["trend_shift"], report["manipulation"],
-        report["btc_analysis"], tv, news, report["session"])
+        report["btc_analysis"], tv, news, report["session"],
+        margin_pct=margin_pct, stoch5m=stoch5m,
+        cvd_data=cvd, onchain_data=onchain, funding_oi=foi)
     report["levels"] = build_levels(tech, book, report["trend_shift"])
 
     # 8. Recovery Ledger & Signal Integration
@@ -470,14 +706,18 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
     acc_loss = get_accumulated_loss(base_asset)
     report["recovery_ledger"] = {"symbol": base_asset, "accumulated_loss": acc_loss}
     if acc_loss > 0:
-        rsi_val = float(tech.get("rsi_14", 50))
-        if rsi_val < 35 or tech.get("macd_hist", 0) > 0:
-            report["recovery_signal"] = {
-                "symbol": base_asset,
-                "signal": "RECOVERY_AVERAGE_DOWN",
-                "accumulated_loss": acc_loss,
-                "recommendation": "Reversal detected on bottom/recovery zone; average down to update breakeven & TP target."
-            }
+        if margin_pct >= MARGIN_FLOOR_PCT:
+            rsi_val = float(tech.get("rsi_14", 50))
+            if rsi_val < 35 or tech.get("macd_hist", 0) > 0:
+                report["recovery_signal"] = {
+                    "symbol": base_asset,
+                    "signal": "RECOVERY_AVERAGE_DOWN",
+                    "accumulated_loss": acc_loss,
+                    "recommendation": "Reversal detected on bottom/recovery zone; average down to update breakeven & TP target."
+                }
+        else:
+            report["recovery_ledger"]["blocked_by_margin"] = True
+            report["recovery_ledger"]["reason"] = f"Free margin {margin_pct}% < {MARGIN_FLOOR_PCT}% floor"
 
     # 9. Hedge Opportunities
     hedge_ops = []
@@ -488,16 +728,35 @@ def run(symbol: str = "XRPUSDT", interval: str = "15m") -> dict:
             "signal": "COUNTER_SHORT_SCALP",
             "reason": f"RSI={rsi_val} overbought / trend exhaustion"
         })
-    elif rsi_val < 25 or (tech.get("trend_exhaustion") and rsi_val < 30):
+    elif stoch5m is not None and stoch5m > 80:
+        hedge_ops.append({
+            "symbol": symbol,
+            "signal": "COUNTER_SHORT_SCALP",
+            "reason": f"5m StochRSI={stoch5m} overbought peak"
+        })
+
+    if rsi_val < 25 or (tech.get("trend_exhaustion") and rsi_val < 30):
         hedge_ops.append({
             "symbol": symbol,
             "signal": "COUNTER_LONG_SCALP",
             "reason": f"RSI={rsi_val} oversold / trend exhaustion"
         })
+    elif stoch5m is not None and stoch5m < 20:
+        hedge_ops.append({
+            "symbol": symbol,
+            "signal": "COUNTER_LONG_SCALP",
+            "reason": f"5m StochRSI={stoch5m} oversold peak"
+        })
     report["hedge_opportunities"] = hedge_ops
 
     # 10. Liquidation map
     report["liq_map"] = _load_liqmap()
+
+    # 11. SOL Swing Analysis
+    report["sol_analysis"] = analyze_sol()
+
+    # 12. ETH Analysis
+    report["eth_analysis"] = analyze_eth()
 
     return report
 
@@ -564,9 +823,12 @@ def _print_human(r: dict):
     m = r["manipulation"]
     b = r["btc_analysis"]
     lv = r["levels"]
+    mp = r.get("margin_pct", 0.0)
     print("=" * 64)
     print(f"  MARKET ANALYSIS — {r['symbol']}  [{r['session']} session]")
     print(f"  {r['generated_at']}")
+    lock_str = " [MARGIN LOCK! <10%]" if mp < MARGIN_FLOOR_PCT else ""
+    print(f"  MARGIN: {mp:.2f}%{lock_str}")
     print("=" * 64)
     print(f"  VERDICT: {v['bias']}  | conviction {v['conviction']:.0%}")
     print(f"  votes L/S: {v['votes_long']}/{v['votes_short']}")
@@ -586,6 +848,16 @@ def _print_human(r: dict):
         print(f"  LIQ-MAP BTC: магніт↓ {nl.get('price')} ({nl.get('dist_pct')}%) | "
               f"магніт↑ {ns.get('price')} ({ns.get('dist_pct')}%) | "
               f"найсильн. {sz.get('price')} [{sz.get('side')}]")
+    sol = r.get("sol_analysis", {})
+    if sol and sol.get("ok"):
+        print(f"  SOL: {sol.get('price')} / {sol.get('bias')} / {sol.get('score')} / "
+              f"entry ~{sol.get('entry_zone')} / TP1 {sol.get('tp1')} (ROI {sol.get('roi_tp1_pct')}%) / "
+              f"TP2 {sol.get('tp2')} (ROI {sol.get('roi_tp2_pct')}%) / {sol.get('close_rule')}")
+    eth = r.get("eth_analysis", {})
+    if eth and eth.get("ok"):
+        print(f"  ETH 50x: {eth.get('price')} / {eth.get('bias')} / entry ~{eth.get('entry_zone')} / "
+              f"TP1 {eth.get('tp1')} (ROI {eth.get('roi_tp1_pct_50x')}%) / TP2 {eth.get('tp2')} (ROI {eth.get('roi_tp2_pct_50x')}%) / "
+              f"SL ~{eth.get('stop_loss_long')} | EstLiq ~{eth.get('est_liq_long')} | {eth.get('close_rule')}")
     print("-" * 64)
     print(f"  ENTRY ~{lv['entry_zone']} | TP1 {lv['tp1']} | TP2 {lv['tp2']} | SL {lv['stop_loss']}")
     print(f"  Book S/R: supp {lv['support_book']} / res {lv['resistance_book']}")
@@ -596,3 +868,4 @@ if __name__ == "__main__":
     rep = run()
     save(rep)
     _print_human(rep)
+

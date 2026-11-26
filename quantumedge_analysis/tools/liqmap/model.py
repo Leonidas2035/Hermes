@@ -55,9 +55,9 @@ def build_heatmap(ohlcv, price_bins=140, oi_series=None, lookback=None):
     n = len(arr)
     last_price = float(c[-1])
 
-    # цінова шкала: діапазон свічок + запас 6% вгору/вниз (де живуть магніти)
-    pmin = float(l.min()) * 0.94
-    pmax = float(h.max()) * 1.06
+    # цінова шкала: діапазон свічок + запас 12% вгору/вниз (щоб вмістити 10x плечі з dist=9.5%)
+    pmin = float(l.min()) * 0.88
+    pmax = float(h.max()) * 1.12
     edges = np.linspace(pmin, pmax, price_bins + 1)
     centers = (edges[:-1] + edges[1:]) / 2.0
     bin_w = edges[1] - edges[0]
@@ -76,24 +76,37 @@ def build_heatmap(ohlcv, price_bins=140, oi_series=None, lookback=None):
     grid = np.zeros((price_bins, n))  # [price_bin, time]
 
     for i in range(n):
-        entry = (o[i] + c[i]) / 2.0  # середня ціна входу на свічці
         vol = v[i] * oi_mult[i]
         if vol <= 0:
             continue
         for side in ("long", "short"):
             for lev, w in LEVERAGE_MIX.items():
+                # Динамічний вхід (FOMO): роздрібні лонги заходять ближче до хаїв, шорти — до лоїв.
+                if side == "long":
+                    entry = (o[i] + c[i] + h[i]) / 3.0
+                else:
+                    entry = (o[i] + c[i] + l[i]) / 3.0
+
                 lp = liq_price(entry, lev, side)
                 if lp <= pmin or lp >= pmax:
                     continue
                 bidx = int((lp - pmin) / bin_w)
                 if bidx < 0 or bidx >= price_bins:
                     continue
-                weight = vol * w * 0.5  # 0.5: half long / half short assumption
+                
+                # Динамічний баланс натовпу замість 50/50:
+                # На зростаючих (зелених) свічках натовп більше бере лонг (65/35).
+                if c[i] > o[i]:
+                    side_ratio = 0.65 if side == "long" else 0.35
+                else:
+                    side_ratio = 0.35 if side == "long" else 0.65
+
+                weight = vol * w * side_ratio
                 touched_at = None
                 sub_l = l[i+1:]
                 sub_h = h[i+1:]
                 if len(sub_l) > 0:
-                    matches = (sub_l <= lp) & (lp <= sub_h)
+                    matches = (sub_l <= lp) if side == "long" else (sub_h >= lp)
                     idx_matches = np.where(matches)[0]
                     if len(idx_matches) > 0:
                         touched_at = int(idx_matches[0] + i + 1)

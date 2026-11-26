@@ -22,7 +22,7 @@ from tools.liqmap.datafeed import fetch_ohlcv, fetch_oi_history, fetch_context
 from tools.liqmap.model import build_heatmap, classify_regime
 from tools.liqmap.dashboard import render_dashboard
 
-RUNTIME = Path("/home/layman/QuantumEdge/runtime")
+RUNTIME = Path(__file__).resolve().parents[2] / "runtime"
 RUNTIME.mkdir(parents=True, exist_ok=True)
 JSON_OUT = RUNTIME / "liqmap_latest.json"
 HTML_OUT = RUNTIME / "liqmap_dashboard.html"

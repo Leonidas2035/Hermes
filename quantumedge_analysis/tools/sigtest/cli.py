@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.sigtest.indicators import enrich
 from tools.sigtest.engine import backtest_signals
 
-QE = Path("/home/layman/QuantumEdge")
+QE = Path(__file__).resolve().parents[2]
 CACHE = QE / "runtime/cache/ohlcv_BTC_USDT_USDT_1h_bybit_365d.json"
 
 

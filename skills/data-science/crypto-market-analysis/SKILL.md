@@ -36,6 +36,25 @@ description: >-
 6. NEVER place orders unless the user sanctions a specific action. Read-only probes
    are safe on testnet.
 
+## Multi-asset live comparison
+When the user asks for BTC/ETH/SOL or another basket, do not reuse a single-symbol
+`latest.json` or an old composite artifact. Fetch every asset directly in one
+read-only pass using swap symbols (`BTC/USDT:USDT`, `ETH/USDT:USDT`,
+`SOL/USDT:USDT`) and collect, for each asset, 15m/1h/4h OHLCV indicators,
+funding, open interest, and top-10 order-book imbalance. State the UTC observation
+time and distinguish current exchange data from stale local reports.
+
+Classify each asset separately:
+- trend alignment: 1h/4h MACD and RSI;
+- tactical timing: 15m/1h StochRSI and Bollinger position;
+- liquidity confirmation: funding/OI and book imbalance;
+- execution zone: current price ±0.5–1.0 ATR, calculated with a tool.
+Do not treat overbought StochRSI alone as a short signal. Require rejection plus
+bearish momentum confirmation. Likewise, bullish MACD alone is not a long entry
+when price is above the upper Bollinger Band. If liquidation-map data is not
+asset-specific, mark that gate unconfirmed rather than borrowing BTC zones for
+ETH/SOL/XRP.
+
 ## Pitfalls (cost real debug cycles — avoid)
 - **ccxt async gotcha**: `import ccxt.async_support as ccxt`, NOT `import ccxt`.
   Using sync `ccxt` makes `await ex.fetch_balance()` raise
